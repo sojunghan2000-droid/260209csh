@@ -24,7 +24,7 @@ from reportlab.lib.utils import ImageReader
 # -----------------------------
 # 0) 공유폴더(현장 공용)
 # -----------------------------
-BASE = Path(r"D:\MaterialToolShared")
+BASE = Path(os.environ.get("MATERIAL_BASE", "./MaterialToolShared"))
 DATA = BASE / "data"
 OUT  = BASE / "output"
 PDFD = OUT / "pdf"

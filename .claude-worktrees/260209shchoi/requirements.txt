@@ -1,0 +1,6 @@
+streamlit>=1.30.0
+pandas
+qrcode[pil]
+Pillow
+reportlab
+streamlit-drawable-canvas
