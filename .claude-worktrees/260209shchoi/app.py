@@ -1,8 +1,10 @@
 # ============================================================
-# Material Gate Tool v2.2 (현장 내부망 상용 UI 라이트 버전)
-# - 밝고 산뜻한 "개발완료 화면" 스타일 (모바일/웹 반응형)
-# - SQLite DB(WAL) 안정, 다중 사용자
-# - 신청/승인(전자서명)/허가증(QR=방문자교육)/게이트/실행(사진+점검카드)/대장/공유팩ZIP/단톡복사
+# Material Gate Tool v2.3.1 (완전 통합본)
+# - 모바일/인앱 브라우저에서도 시작 가능(메인 로그인 카드 추가)
+# - 상단 탭 네비(사이드바 메뉴 제거)
+# - 산출물 위치/생성 파일 리스트 표시
+# - KPI 버튼 클릭 → 화면 이동
+# - camera_input 우선(모바일 사진 버튼 이슈 해결)
 # ============================================================
 
 import os, json, zipfile, sqlite3, socket, html
@@ -92,7 +94,6 @@ def init_db():
             payload TEXT
         );
         """)
-        # ✅ 신규 컬럼(있으면 무시)
         ensure_column(con, "requests", "driver_phone", "TEXT")
 
 init_db()
@@ -173,6 +174,21 @@ def save_upload(rid: str, tag: str, up) -> str:
     outp.write_bytes(up.getbuffer())
     return str(outp)
 
+def save_camera(rid: str, tag: str, cam) -> str:
+    if cam is None:
+        return ""
+    folder = PHOTOD / rid
+    folder.mkdir(parents=True, exist_ok=True)
+    outp = folder / f"{tag}_{datetime.now().strftime('%H%M%S')}.jpg"
+    outp.write_bytes(cam.getvalue())
+    return str(outp)
+
+def save_cam_or_upload(rid: str, tag: str, cam, up) -> str:
+    p = save_camera(rid, tag, cam)
+    if p:
+        return p
+    return save_upload(rid, tag, up)
+
 def sign_path(rid: str) -> Path:
     return SIGND / f"{rid}.png"
 
@@ -198,7 +214,6 @@ def gen_approval_pdf(r: dict) -> str:
     c.drawString(50, 660, f"신청: {r.get('created_by','')}  ({r.get('created_at','')})")
     c.drawString(50, 642, f"승인: {r.get('approved_by','')}  ({r.get('approved_at','')})")
 
-    # 승인자 서명
     sp = sign_path(rid)
     c.setFont("Helvetica-Bold", 11)
     c.drawString(50, 610, "전자서명(승인자)")
@@ -211,7 +226,6 @@ def gen_approval_pdf(r: dict) -> str:
             c.setFont("Helvetica", 10)
             c.drawString(60, 570, "서명 이미지 로드 실패")
 
-    # 게이트 확인 QR(요청ID)
     qr_file = QRD / f"{rid}_req.png"
     make_qr_png(rid, qr_file)
     c.drawString(350, 610, "게이트 확인 QR(요청ID)")
@@ -227,7 +241,6 @@ def gen_approval_pdf(r: dict) -> str:
     return str(out)
 
 def gen_entry_permit_pdf(r: dict, training_url: str) -> str:
-    """자재 차량 진출입 허가증(양식형) 1장 + QR(방문자교육 링크)"""
     rid = r["rid"]
     out = PDFD / f"{rid}_permit.pdf"
     c = canvas.Canvas(str(out), pagesize=A4)
@@ -239,7 +252,6 @@ def gen_entry_permit_pdf(r: dict, training_url: str) -> str:
     c.drawString(70, 770, f"요청ID: {rid} | 구분: {r['io_type']} | 일자/시간: {r['work_date']} {r['work_time']}")
     c.drawString(70, 754, f"GATE: {r['gate']} | 차량번호: {r['vehicle']}")
 
-    # 입력란
     c.setFont("Helvetica-Bold", 11)
     c.drawString(70, 720, "입고 회사명")
     c.rect(70, 690, 300, 26)
@@ -252,7 +264,6 @@ def gen_entry_permit_pdf(r: dict, training_url: str) -> str:
     c.setFont("Helvetica", 11)
     c.drawString(398, 698, r.get("driver_phone",""))
 
-    # 필수 준수사항
     c.setFont("Helvetica-Bold", 12)
     c.drawString(70, 650, "★ 필수 준수사항 ★")
     c.setFont("Helvetica", 11)
@@ -269,7 +280,6 @@ def gen_entry_permit_pdf(r: dict, training_url: str) -> str:
         c.drawString(80, y, it)
         y -= 18
 
-    # QR: 방문자교육 링크
     qr_file = QRD / f"{rid}_training.png"
     make_qr_png(training_url, qr_file)
 
@@ -283,14 +293,12 @@ def gen_entry_permit_pdf(r: dict, training_url: str) -> str:
     c.setFont("Helvetica", 9)
     c.drawString(70, 305, "QR코드 인식 후 이수")
 
-    # 서명란
     c.setFont("Helvetica-Bold", 11)
     c.drawString(260, 420, "운전원 확인:")
     c.rect(350, 395, 190, 40)
     c.drawString(260, 355, "담당자 확인:")
     c.rect(350, 330, 190, 40)
 
-    # 승인자 서명 재사용(담당자 확인란)
     sp = sign_path(rid)
     if sp.exists():
         try:
@@ -413,13 +421,11 @@ def make_share_zip(rid: str, files: list[str]) -> str:
             if f and Path(f).exists():
                 z.write(f, arcname=Path(f).name)
 
-        # 사진폴더 포함
         pdir = PHOTOD / rid
         if pdir.exists():
             for fp in pdir.glob("*.*"):
                 z.write(fp, arcname=f"photos/{fp.name}")
 
-        # 서명 포함
         sp = sign_path(rid)
         if sp.exists():
             z.write(sp, arcname=f"sign/{sp.name}")
@@ -428,7 +434,7 @@ def make_share_zip(rid: str, files: list[str]) -> str:
 
 
 # -----------------------------
-# 6) 단톡 복사용 UI (밝은 카드)
+# 6) 단톡 복사용 UI
 # -----------------------------
 def copy_box(text: str, title="단톡 공유 문구"):
     safe = html.escape(text)
@@ -481,70 +487,136 @@ def msg_template(title: str, r: dict, files: dict | None = None, extra: str = ""
 
 
 # -----------------------------
-# 7) 라이트 UI (당근/지도 느낌: 밝은 배경+카드+라운드)
+# 7) 산출물 표시
 # -----------------------------
-st.set_page_config(page_title=f"{SITE_NAME} v2.2", layout="wide")
+def outputs_panel(rid: str | None = None):
+    with st.expander("📦 산출물 생성 위치 / 생성 파일 확인", expanded=False):
+        st.code(f"""
+공유폴더(BASE): {BASE}
+PDF:  {PDFD}
+QR:   {QRD}
+ZIP:  {ZIPD}
+사진: {PHOTOD}
+서명: {SIGND}
+점검: {CHECKD}
+DB:   {DB}
+""".strip())
+
+        if rid:
+            st.markdown("**이번 요청 생성 파일(최대 40개 표시)**")
+            files = []
+            for folder in [PDFD, QRD, ZIPD, CHECKD]:
+                files += sorted(Path(folder).glob(f"*{rid}*"))
+            pdir = PHOTOD / rid
+            if pdir.exists():
+                files += sorted(pdir.glob("*.*"))
+            sp = sign_path(rid)
+            if sp.exists():
+                files.append(sp)
+
+            if not files:
+                st.info("아직 생성된 산출물이 없습니다.")
+            else:
+                for f in files[:40]:
+                    st.write(f"• {f}")
+
+
+# -----------------------------
+# 8) UI / 모바일 최적
+# -----------------------------
+st.set_page_config(
+    page_title=f"{SITE_NAME} v2.3.1",
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
 
 st.markdown("""
 <style>
   #MainMenu, footer, header {visibility:hidden;}
-  .block-container{max-width:1200px;padding-top:0.8rem;padding-bottom:1.0rem;}
+  .block-container{max-width:980px;padding-top:0.65rem;padding-bottom:1.0rem;}
   body{background:#F6F7FB;}
   [data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#F6F7FB 0%, #FFFFFF 40%, #F6F7FB 100%);}
   .topbar{
      background:linear-gradient(135deg,#2563EB 0%, #06B6D4 100%);
-     border-radius:22px; padding:16px 18px; color:white;
+     border-radius:22px; padding:14px 16px; color:white;
      box-shadow:0 14px 30px rgba(37,99,235,.18);
-     margin-bottom:12px;
+     margin-bottom:10px;
   }
   .topbar .title{font-size:18px;font-weight:900;line-height:1.2;}
-  .topbar .sub{opacity:.9;font-size:13px;font-weight:700;margin-top:4px;}
+  .topbar .sub{opacity:.9;font-size:12.5px;font-weight:700;margin-top:4px;}
   .pill{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.18);
-        padding:8px 10px;border-radius:999px;font-weight:800;font-size:12px;}
+        padding:7px 10px;border-radius:999px;font-weight:800;font-size:12px;}
   .card{
      background:#FFFFFF;border:1px solid #E5E7EB;border-radius:18px;padding:14px;
      box-shadow:0 8px 20px rgba(17,24,39,.06);
+     margin-top:10px;
   }
-  .kpiwrap{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;}
-  @media (max-width: 980px){
-    .kpiwrap{grid-template-columns:repeat(2,1fr);}
-    div[data-testid="stHorizontalBlock"]{flex-wrap:wrap!important;}
-    div[data-testid="stHorizontalBlock"]>div{min-width:100%!important;flex:1 1 100%!important;}
-  }
-  .kpi{padding:12px;border-radius:18px;border:1px solid #E5E7EB;background:#FFFFFF;
-       box-shadow:0 8px 18px rgba(17,24,39,.06);}
-  .kpi .label{color:#6B7280;font-weight:800;font-size:12px;}
-  .kpi .val{color:#111827;font-weight:950;font-size:22px;margin-top:6px;}
   .hint{color:#6B7280;font-size:12px;font-weight:700;}
-  .badge{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;font-weight:900;font-size:12px;}
-  .b-p{background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;}
-  .b-a{background:#DCFCE7;color:#166534;border:1px solid #BBF7D0;}
-  .b-r{background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;}
 </style>
 """, unsafe_allow_html=True)
 
 
 # -----------------------------
-# 8) 사이드바 (오늘 배포용: 최소 입력)
+# 9) ✅ 로그인(모바일 대비: 메인 카드 + 사이드바 동시 지원)
 # -----------------------------
+# 세션 기본값
+if "actor" not in st.session_state:
+    st.session_state.actor = ""
+if "training_url" not in st.session_state:
+    st.session_state.training_url = VISITOR_TRAINING_URL_DEFAULT
+
 with st.sidebar:
-    st.subheader("👤 사용자")
-    actor = st.text_input("이름/직책", value="", placeholder="예) 공무팀장 홍길동")
-    st.divider()
-    training_url = st.text_input("SIC 방문자교육 URL", value=VISITOR_TRAINING_URL_DEFAULT)
-    st.caption("※ 허가증 QR에 들어가는 링크입니다.")
-    st.divider()
-    page = st.radio("메뉴", ["홈", "신청", "승인", "게이트", "실행", "대장"], index=0)
-    st.caption(f"DB: {DB}")
+    st.subheader("설정")
+    actor_side = st.text_input("이름/직책", value=st.session_state.actor, placeholder="예) 공무팀장 홍길동")
+    url_side = st.text_input("SIC 방문자교육 URL", value=st.session_state.training_url)
+    st.caption("허가증 QR에 들어가는 링크입니다.")
     st.caption(f"공유폴더: {BASE}")
 
-if not actor.strip():
-    st.info("좌측에서 이름/직책을 입력하면 시작합니다.")
+# 사이드바 입력값 세션 저장(입력되었을 때)
+if actor_side.strip():
+    st.session_state.actor = actor_side.strip()
+if url_side.strip():
+    st.session_state.training_url = url_side.strip()
+
+# ✅ 메인 로그인 카드(인앱 브라우저에서도 100% 보임)
+if not st.session_state.actor.strip():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("👤 사용자 정보 입력")
+    st.caption("모바일에서 좌측 메뉴(≡)가 안 보일 수 있어, 여기서 바로 입력하면 시작됩니다.")
+    a = st.text_input("이름/직책*", value="", placeholder="예) 공무팀장 홍길동", key="actor_main")
+    u = st.text_input("SIC 방문자교육 URL", value=VISITOR_TRAINING_URL_DEFAULT, key="url_main")
+    col1, col2 = st.columns([1,1])
+    if col1.button("시작하기", use_container_width=True):
+        if not a.strip():
+            st.error("이름/직책을 입력하세요.")
+        else:
+            st.session_state.actor = a.strip()
+            st.session_state.training_url = u.strip() if u.strip() else VISITOR_TRAINING_URL_DEFAULT
+            st.rerun()
+    if col2.button("기본값 사용", use_container_width=True):
+        st.session_state.actor = "현장사용자"
+        st.session_state.training_url = VISITOR_TRAINING_URL_DEFAULT
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
+
+actor = st.session_state.actor
+training_url = st.session_state.training_url
 
 
 # -----------------------------
-# 9) 상단 헤더 + KPI
+# 10) 상단 탭 네비
+# -----------------------------
+if "page" not in st.session_state:
+    st.session_state.page = "홈"
+
+tabs = ["홈", "신청", "승인", "게이트", "실행", "대장"]
+page = st.radio(" ", tabs, horizontal=True, index=tabs.index(st.session_state.page))
+st.session_state.page = page
+
+
+# -----------------------------
+# 11) 헤더 + KPI 버튼
 # -----------------------------
 df_all = fetch_requests()
 today = date.today().isoformat()
@@ -559,27 +631,29 @@ st.markdown(f"""
 <div class="topbar">
   <div class="title">{SITE_NAME} · 내부망 운영</div>
   <div class="sub">
-    <span class="pill">👤 {html.escape(actor.strip())}</span>
+    <span class="pill">👤 {html.escape(actor)}</span>
     <span class="pill">📅 {today}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown(f"""
-<div class="kpiwrap">
-  <div class="kpi"><div class="label">오늘 요청</div><div class="val">{cnt_req}</div></div>
-  <div class="kpi"><div class="label">승인</div><div class="val">{cnt_apv}</div></div>
-  <div class="kpi"><div class="label">대기</div><div class="val">{cnt_pen}</div></div>
-  <div class="kpi"><div class="label">실행완료</div><div class="val">{cnt_exec}</div></div>
-  <div class="kpi"><div class="label">고위험</div><div class="val">{cnt_risk}</div></div>
-</div>
-""", unsafe_allow_html=True)
+k1, k2, k3, k4, k5 = st.columns(5)
+if k1.button(f"오늘요청\n{cnt_req}", use_container_width=True):
+    st.session_state.page = "대장"; st.rerun()
+if k2.button(f"승인\n{cnt_apv}", use_container_width=True):
+    st.session_state.page = "승인"; st.rerun()
+if k3.button(f"대기\n{cnt_pen}", use_container_width=True):
+    st.session_state.page = "승인"; st.rerun()
+if k4.button(f"실행\n{cnt_exec}", use_container_width=True):
+    st.session_state.page = "실행"; st.rerun()
+if k5.button(f"고위험\n{cnt_risk}", use_container_width=True):
+    st.session_state.page = "대장"; st.rerun()
 
-st.write("")
+outputs_panel(None)
 
 
 # -----------------------------
-# 홈: 접속 QR (협력사 포함 현장 배포용)
+# 홈: 접속 QR
 # -----------------------------
 if page == "홈":
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -592,18 +666,14 @@ if page == "홈":
     qr_file = QRD / f"SERVER_{ip}_{PORT}.png"
     make_qr_png(url, qr_file)
 
-    c1, c2 = st.columns([1,1])
-    with c1:
-        st.markdown(f"**접속 주소:** `{url}`")
-        st.caption("서버PC 방화벽 인바운드 8501 허용 + IP 고정(DHCP 예약) 권장")
-    with c2:
-        st.image(str(qr_file), width=240, caption="현장 출입구/사무실 부착용")
+    st.markdown(f"**접속 주소:** `{url}`")
+    st.image(str(qr_file), width=260, caption="현장 출입구/사무실 부착용")
 
     st.write("---")
-    st.markdown("#### ✅ 오늘 배포 체크")
-    st.write("- 서버PC 실행: `streamlit run app.py --server.address 0.0.0.0 --server.port 8501`")
-    st.write("- 방화벽 허용(8501) + IP 고정")
-    st.write("- 협력사에게: QR 찍고 `이름/직책` 입력 후 사용")
+    st.markdown("#### ✅ 운영 체크")
+    st.write("- 실행: `streamlit run app.py --server.address 0.0.0.0 --server.port 8501`")
+    st.write("- 방화벽 허용(8501) + IP 고정(DHCP 예약)")
+    st.write("- 협력사: QR 접속 → (메인) 이름/직책 입력 후 사용")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -614,19 +684,17 @@ elif page == "신청":
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("📝 반입/반출 신청")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        io_type = st.radio("구분*", ["반입","반출"], horizontal=True)
-        company = st.text_input("협력회사*", "")
-        material = st.text_input("자재/화물*", "")
-        vehicle = st.text_input("차량번호*", "")
-        driver_phone = st.text_input("운전원 연락처*", "", placeholder="예) 010-1234-5678")
-    with c2:
-        gate = st.selectbox("사용 GATE*", ["1GATE","2GATE","3GATE"])
-        work_date = st.date_input("일자*", value=date.today()).isoformat()
-        work_time = st.selectbox("시간*", [f"{h:02d}:{m:02d}" for h in range(6,21) for m in (0,30)])
-        risk = st.selectbox("위험도(간단)*", ["정상","고위험"])
-        note = st.text_area("비고(선택)", "", height=120)
+    io_type = st.radio("구분*", ["반입","반출"], horizontal=True)
+    company = st.text_input("협력회사*", "")
+    material = st.text_input("자재/화물*", "")
+    vehicle = st.text_input("차량번호*", "")
+    driver_phone = st.text_input("운전원 연락처*", "", placeholder="예) 010-1234-5678")
+
+    gate = st.selectbox("사용 GATE*", ["1GATE","2GATE","3GATE"])
+    work_date = st.date_input("일자*", value=date.today()).isoformat()
+    work_time = st.selectbox("시간*", [f"{h:02d}:{m:02d}" for h in range(6,21) for m in (0,30)])
+    risk = st.selectbox("위험도(간단)*", ["정상","고위험"])
+    note = st.text_area("비고(선택)", "", height=110)
 
     can_submit = all([company.strip(), material.strip(), vehicle.strip(), driver_phone.strip()])
     if st.button("📨 신청 등록", use_container_width=True, disabled=not can_submit):
@@ -638,13 +706,15 @@ elif page == "신청":
                   rid,io_type,company,material,vehicle,driver_phone,gate,work_date,work_time,note,risk,status,created_at,created_by
                 )
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (rid, io_type, company, material, vehicle, driver_phone, gate, work_date, work_time, note, risk, "PENDING", now, actor.strip()))
+            """, (rid, io_type, company, material, vehicle, driver_phone, gate, work_date, work_time, note, risk, "PENDING", now, actor))
         log_event(rid, "REQUEST_CREATED", actor, {"io_type":io_type})
 
         r = get_request(rid)
         msg = msg_template("신청 접수", r, extra="승인 완료되면: 승인서+허가증(QR)+공유팩(zip) 생성")
         st.success(f"등록 완료: {rid}")
         copy_box(msg, "단톡 공유 문구(신청 접수)")
+        outputs_panel(rid)
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -670,24 +740,12 @@ elif page == "승인":
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
-    status_badge = '<span class="badge b-p">PENDING</span>' if r["status"]=="PENDING" else (
-        '<span class="badge b-a">APPROVED</span>' if r["status"]=="APPROVED" else '<span class="badge b-r">REJECT</span>'
-    )
-
-    st.markdown(f"""
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0;">
-      <div>
-        <div style="font-weight:950;font-size:16px;color:#111827;">
-          {html.escape(r['io_type'])} · {html.escape(r['company'])} · {html.escape(r['material'])}
-        </div>
-        <div class="hint">차량/연락처: {html.escape(r['vehicle'])} / {html.escape(r.get('driver_phone',''))} · GATE/시간: {html.escape(r['gate'])} / {html.escape(r['work_date'])} {html.escape(r['work_time'])}</div>
-      </div>
-      <div>{status_badge}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"**{r['io_type']} / {r['company']} / {r['material']}**")
+    st.caption(f"차량/연락처: {r['vehicle']} / {r.get('driver_phone','')}  ·  GATE/시간: {r['gate']} / {r['work_date']} {r['work_time']}")
 
     if r["status"] != "PENDING":
         st.warning("이미 처리된 요청입니다. (대기 상태만 승인 가능)")
+        outputs_panel(rid)
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
@@ -702,20 +760,19 @@ elif page == "승인":
     )
 
     if st.button("✅ 승인 완료(승인서+허가증+공유팩 생성)", use_container_width=True):
-        # 서명 저장
         if canv.image_data is not None:
             Image.fromarray(canv.image_data.astype("uint8")).save(sign_path(rid))
 
         now = datetime.now().isoformat(timespec="seconds")
         with db() as con:
             con.execute("UPDATE requests SET status='APPROVED', approved_at=?, approved_by=? WHERE rid=?",
-                        (now, actor.strip(), rid))
+                        (now, actor, rid))
         log_event(rid, "APPROVED", actor, {})
 
         r2 = get_request(rid)
         approval_pdf = gen_approval_pdf(r2)
-        permit_pdf = gen_entry_permit_pdf(r2, training_url)  # ✅ QR=방문자교육 링크
-        req_qr = str(QRD / f"{rid}_req.png")                 # ✅ 게이트 확인 QR(요청ID)
+        permit_pdf = gen_entry_permit_pdf(r2, training_url)
+        req_qr = str(QRD / f"{rid}_req.png")
         share_zip = make_share_zip(rid, [approval_pdf, permit_pdf, req_qr])
 
         msg = msg_template("승인 완료", r2, files={
@@ -725,21 +782,18 @@ elif page == "승인":
         }, extra="허가증 QR = SIC 방문자교육 링크")
         st.success("승인 완료 + 승인서/허가증/공유팩 생성 완료")
         copy_box(msg, "단톡 공유 문구(승인 완료)")
-        st.caption("파일 경로(단톡에는 sharepack.zip 한 개만 첨부하면 끝)")
-        st.write(f"- 승인서: {approval_pdf}")
-        st.write(f"- 허가증(QR): {permit_pdf}")
-        st.write(f"- 공유팩(zip): {share_zip}")
+        outputs_panel(rid)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # -----------------------------
-# 게이트(현장 통과 확인)
+# 게이트 확인
 # -----------------------------
 elif page == "게이트":
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("🚧 게이트 확인")
-    st.caption("승인서에 있는 QR(요청ID)을 스캔한 값(REQ_...)을 입력하면 통과/차단이 바로 나옵니다.")
+    st.caption("승인서 QR(요청ID)을 스캔한 값(REQ_...)을 입력하면 통과/차단이 바로 나옵니다.")
 
     rid = st.text_input("요청ID 입력", value="", placeholder="예) REQ_20260206_070000_123")
 
@@ -758,11 +812,13 @@ elif page == "게이트":
             st.write(f"차량/연락처: {r['vehicle']} / {r.get('driver_phone','')}")
             st.write(f"GATE/시간: {r['gate']} / {r['work_date']} {r['work_time']}")
             st.write(f"위험도: {r.get('risk','')}")
+            outputs_panel(rid.strip())
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # -----------------------------
-# 실행(사진/점검) — "현장 실행 사진 3종 + 참석자 + 핵심 점검"
+# 실행(사진/점검)
 # -----------------------------
 elif page == "실행":
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -782,23 +838,14 @@ elif page == "실행":
     rid = st.selectbox("대상(승인 완료)", approved["rid"].tolist())
     r = get_request(rid)
 
-    st.markdown(f"""
-    <div style="margin:8px 0 14px 0;">
-      <div style="font-weight:950;font-size:16px;color:#111827;">
-        {html.escape(r['io_type'])} · {html.escape(r['company'])} · {html.escape(r['material'])}
-      </div>
-      <div class="hint">차량/연락처: {html.escape(r['vehicle'])} / {html.escape(r.get('driver_phone',''))}
-      · GATE/시간: {html.escape(r['gate'])} / {html.escape(r['work_date'])} {html.escape(r['work_time'])}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"**{r['io_type']} / {r['company']} / {r['material']}**")
+    st.caption(f"차량/연락처: {r['vehicle']} / {r.get('driver_phone','')}  ·  GATE/시간: {r['gate']} / {r['work_date']} {r['work_time']}")
 
     st.markdown("#### 0. 참석자 체크(필수)")
     base = ["협력회사 담당자","장비운전원","차량운전원","유도원","안전보조원/감시단"]
     attendees = {}
-    cols = st.columns(2)
-    for i,p in enumerate(base):
-        with cols[i%2]:
-            attendees[p] = st.checkbox(p, value=True, key=f"att_{rid}_{p}")
+    for p in base:
+        attendees[p] = st.checkbox(p, value=True, key=f"att_{rid}_{p}")
 
     st.markdown("#### 3~10. 핵심 점검(필수)")
     checks = {
@@ -816,27 +863,34 @@ elif page == "실행":
         checklist[k] = st.checkbox(txt, value=True, key=f"ck_{rid}_{k}")
 
     st.markdown("#### 실행 사진(필수 3종)")
-    up_before = st.file_uploader("상차 전", type=["jpg","jpeg","png"], key=f"phb_{rid}")
-    up_after  = st.file_uploader("상차 후", type=["jpg","jpeg","png"], key=f"pha_{rid}")
-    up_tie    = st.file_uploader("결속/로프/밴딩(근접)", type=["jpg","jpeg","png"], key=f"pht_{rid}")
+    cam_before = st.camera_input("상차 전(촬영)", key=f"cam_before_{rid}")
+    cam_after  = st.camera_input("상차 후(촬영)", key=f"cam_after_{rid}")
+    cam_tie    = st.camera_input("결속/로프/밴딩(근접 촬영)", key=f"cam_tie_{rid}")
+
+    with st.expander("📎 파일 업로드(선택: PC/기존 사진)", expanded=False):
+        up_before = st.file_uploader("상차 전(업로드)", type=["jpg","jpeg","png"], key=f"up_before_{rid}")
+        up_after  = st.file_uploader("상차 후(업로드)", type=["jpg","jpeg","png"], key=f"up_after_{rid}")
+        up_tie    = st.file_uploader("결속/로프/밴딩(업로드)", type=["jpg","jpeg","png"], key=f"up_tie_{rid}")
 
     if st.button("✅ 실행 완료 처리 + 공유팩 갱신", use_container_width=True):
         miss_att = [p for p in base if not attendees.get(p, False)]
         if miss_att:
             st.error(f"필수 참석자 미확인: {', '.join(miss_att)}"); st.stop()
-        miss_ck = [k for k,v in checklist.items() if not v]
-        if miss_ck:
-            st.error("점검 FAIL 항목이 있어 실행 완료 처리 불가"); st.stop()
-        if not (up_before and up_after and up_tie):
-            st.error("필수 사진(3종) 업로드가 필요합니다."); st.stop()
 
-        p_before = save_upload(rid, "before", up_before)
-        p_after  = save_upload(rid, "after", up_after)
-        p_tie    = save_upload(rid, "tie", up_tie)
+        fail_ck = [k for k,v in checklist.items() if not v]
+        if fail_ck:
+            st.error("점검 FAIL 항목이 있어 실행 완료 처리 불가"); st.stop()
+
+        p_before = save_cam_or_upload(rid, "before", cam_before, up_before)
+        p_after  = save_cam_or_upload(rid, "after",  cam_after,  up_after)
+        p_tie    = save_cam_or_upload(rid, "tie",    cam_tie,    up_tie)
+
+        if not (p_before and p_after and p_tie):
+            st.error("필수 사진(3종)이 필요합니다. (촬영 또는 업로드)"); st.stop()
 
         now = datetime.now().isoformat(timespec="seconds")
         with db() as con:
-            con.execute("UPDATE requests SET exec_at=?, exec_by=? WHERE rid=?", (now, actor.strip(), rid))
+            con.execute("UPDATE requests SET exec_at=?, exec_by=? WHERE rid=?", (now, actor, rid))
         log_event(rid, "EXEC_COMPLETED", actor, {"photos": True})
 
         r2 = get_request(rid)
@@ -856,16 +910,13 @@ elif page == "실행":
         }, extra="단톡: 문구 붙여넣기 + sharepack.zip 1개 첨부")
         st.success("실행 완료 + 점검카드/실행기록/공유팩 갱신 완료")
         copy_box(msg, "단톡 공유 문구(실행 완료)")
-        st.caption("파일 경로(단톡에는 sharepack.zip 한 개만 첨부하면 끝)")
-        st.write(f"- 점검카드: {check_pdf}")
-        st.write(f"- 실행기록: {exec_pdf}")
-        st.write(f"- 공유팩(zip): {share_zip}")
+        outputs_panel(rid)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # -----------------------------
-# 대장(오늘/전체) + 이벤트 로그
+# 대장 + 이벤트 로그
 # -----------------------------
 else:
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -877,11 +928,7 @@ else:
         st.stop()
 
     only_today = st.toggle("오늘 건만 보기", value=True)
-    if only_today:
-        df2 = df_all[df_all["work_date"]==today].copy()
-    else:
-        df2 = df_all.copy()
-
+    df2 = df_all[df_all["work_date"]==today].copy() if only_today else df_all.copy()
     st.dataframe(df2, use_container_width=True, hide_index=True)
 
     st.write("---")
@@ -894,5 +941,6 @@ else:
             st.dataframe(pd.DataFrame(rows, columns=["ts","event","actor","payload"]), use_container_width=True, hide_index=True)
         else:
             st.info("로그가 없습니다.")
+        outputs_panel(rid.strip())
 
     st.markdown("</div>", unsafe_allow_html=True)
