@@ -1,6 +1,4 @@
 streamlit>=1.30.0
-flask
-werkzeug
 qrcode[pil]
 Pillow
 reportlab
