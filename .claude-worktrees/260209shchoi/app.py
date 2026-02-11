@@ -113,7 +113,7 @@ def default_time_to():
 # DB Layer (with migration)
 # ----------------------------
 def db_connect():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     con.row_factory = sqlite3.Row
     return con
 
@@ -306,10 +306,17 @@ def db_init_and_migrate():
             con.commit()
 
     # --- default settings ---
+    # check if settings table has updated_at column
+    settings_cols = _table_columns(cur, "settings")
+    has_updated_at = "updated_at" in settings_cols
+
     def set_default(key, val):
         cur.execute("SELECT value FROM settings WHERE key=?", (key,))
         if cur.fetchone() is None:
-            cur.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, val))
+            if has_updated_at:
+                cur.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,datetime('now'))", (key, val))
+            else:
+                cur.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, val))
 
     set_default("site_pin_hash", sha256(DEFAULT_SITE_PIN))
     set_default("admin_pin_hash", sha256(DEFAULT_ADMIN_PIN))
