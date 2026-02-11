@@ -1,1480 +1,1033 @@
 # ============================================================
-# MaterialTool app.py v2.4.3 (FULL OVERWRITE / Production PoC)
-# - 필수 3종(상차 전/후, 결속근접) 충족해야 EXECUTED 등록 가능
-# - 추가 사진은 옵션(여러 장) 저장/리포트 포함
-# - A안: 역할=관리자 선택 시 Admin PIN 입력칸 표시
-# - QR 안정화: URL 정규화/검증 + 로그인/승인 화면 QR 미리보기 + 클릭 테스트 링크
-# - Workflow: 신청(PENDING) -> 승인(APPROVED) -> 게이트확인 -> 실행(EXECUTED)
-# - Outputs: 승인서PDF, 허가증(QR)PDF, 점검카드PDF, 실행사진PDF,
-#            PACKET_LIGHT, PACKET_FULL(단톡 1개 업로드용), ZIP(옵션)
-# - Storage: SQLite(DB파일) + 폴더 기반 산출물 저장
+# Material In/Out Approval Tool — SINGLE FILE INTEGRATED
+# - AIO: DB + PDF + FileServer + Streamlit UI
+# - Mobile/Web responsive, Admin PIN visible via toggle
+# - Outputs: Plan PDF / Checkcard PDF / Permit PDF(QR) / ZIP bundle
+# - External share: PUBLIC_BASE_URL + Flask file server token links
 # ============================================================
 
-import os
-import io
-import re
-import json
-import zipfile
-import hashlib
-import sqlite3
-from datetime import datetime, date
-from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+import os, io, re, json, uuid, time, base64, hashlib, zipfile, sqlite3, threading
+from datetime import datetime
+from typing import Dict, Any, Optional, List
 
 import streamlit as st
-from PIL import Image
 
-import qrcode
+# ----- Optional/Required libs -----
+from flask import Flask, abort, send_file
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib import colors
+from reportlab.platypus import Table, TableStyle
 
-from streamlit_drawable_canvas import st_canvas
-
-
-# =========================
-# 0) CONFIG
-# =========================
-APP_VERSION = "2.4.3"
-APP_TITLE = "자재 반출입 승인 Tool"
-
-ROLE_OPTIONS = ["협력사", "공무", "안전", "경비", "관리자"]
-
-BASE = Path(os.environ.get("MATERIAL_BASE", "./MaterialToolShared"))
-
-SITE_PIN = os.getenv("MTOOL_SITE_PIN", "1234")
-ADMIN_PIN = os.getenv("MTOOL_ADMIN_PIN", "9999")
-
-DEFAULT_SIC_URL = os.getenv("MTOOL_SIC_URL", "https://example.com/visitor-training")
-
-# 공유폴더 UNC(선택)  예) \\SERVER01\\MaterialToolShared
-SHARE_UNC = os.getenv("MTOOL_SHARE_UNC", "").strip()
-
-PHOTO_ROLES_DEFAULT = {"공무", "안전", "관리자"}
-REQUIRED_PHOTOS = 3
-
-DB_PATH = BASE / "data" / "gate.db"
+import qrcode
+from PIL import Image
 
 
 # =========================
-# 1) UTIL
+# 0) SETTINGS (ENV)
 # =========================
-def now_ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+APP_NAME = "자재 반출입 승인툴"
+APP_VER  = "v2.5.0-single"
 
-def safe_text(s: str, limit: int = 300) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    return s[:limit]
+# 로컬 저장 루트(서버 PC). 클라우드/로컬 호환.
+BASE_DIR = os.getenv("MATERIAL_BASE", os.path.join(os.getcwd(), "MaterialToolShared"))
 
-def _hash_pin(pin: str) -> str:
-    return hashlib.sha256((pin or "").strip().encode("utf-8")).hexdigest()
+# 외부/모바일에서 열 수 있는 파일 링크를 만들기 위한 공개 주소
+# 예) https://59.11.100.40:8801  또는  https://your.domain.com
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://YOUR-PUBLIC-HOST:8801").rstrip("/")
 
-SITE_PIN_H = _hash_pin(SITE_PIN)
-ADMIN_PIN_H = _hash_pin(ADMIN_PIN)
+# File server (외부 PDF 링크 제공)
+FILE_SERVER_HOST = os.getenv("FILE_SERVER_HOST", "0.0.0.0")
+FILE_SERVER_PORT = int(os.getenv("FILE_SERVER_PORT", "8801"))
 
-def verify_pin(pin: str, pin_hash: str) -> bool:
-    return _hash_pin(pin) == pin_hash
+# Streamlit port(실행 시 --server.port로 설정 권장)
+# STREAMLIT_PORT = int(os.getenv("STREAMLIT_PORT", "8501"))
+
+# 기본 PIN (DB meta에 저장되며, 관리자 화면에서 변경 가능)
+SITE_PIN_DEFAULT  = os.getenv("MTOOL_SITE_PIN", "1357")
+ADMIN_PIN_DEFAULT = os.getenv("MTOOL_ADMIN_PIN", "8642")
+
+# 방문자 교육 링크(허가증 QR에 인코딩)
+DEFAULT_VISITOR_TRAINING_URL = os.getenv("VISITOR_TRAINING_URL", "https://example.com/visitor-training")
+
+
+# =========================
+# 1) PATHS / DIRS
+# =========================
+def p(*parts): return os.path.normpath(os.path.join(*parts))
+
+PATHS = {
+    "BASE": BASE_DIR,
+    "DATA": p(BASE_DIR, "data"),
+    "DB":   p(BASE_DIR, "data", "gate.db"),
+    "OUT":  p(BASE_DIR, "output"),
+    "PDF":  p(BASE_DIR, "output", "pdf"),
+    "CHECK":p(BASE_DIR, "output", "check"),
+    "PERMIT":p(BASE_DIR,"output","permit"),
+    "ZIP":  p(BASE_DIR, "output", "zip"),
+    "PHOTOS":p(BASE_DIR,"output","photos"),
+    "TMP":  p(BASE_DIR, "tmp"),
+}
 
 def ensure_dirs():
-    (BASE / "data").mkdir(parents=True, exist_ok=True)
-    (BASE / "output" / "pdf").mkdir(parents=True, exist_ok=True)
-    (BASE / "output" / "packet").mkdir(parents=True, exist_ok=True)
-    (BASE / "output" / "check").mkdir(parents=True, exist_ok=True)
-    (BASE / "output" / "photos").mkdir(parents=True, exist_ok=True)
-    (BASE / "output" / "sign").mkdir(parents=True, exist_ok=True)
-    (BASE / "output" / "zip").mkdir(parents=True, exist_ok=True)
+    os.makedirs(PATHS["DATA"], exist_ok=True)
+    for k in ["OUT","PDF","CHECK","PERMIT","ZIP","PHOTOS","TMP"]:
+        os.makedirs(PATHS[k], exist_ok=True)
 
-def get_unc_path(local_path: str) -> str:
-    try:
-        p = Path(local_path)
-        if not SHARE_UNC:
-            return local_path
-        rel = p.relative_to(BASE)
-        return str(Path(SHARE_UNC) / rel).replace("/", "\\")
-    except Exception:
-        return local_path
-
-def bytes_to_jpg_bytes(img_bytes: bytes, max_w: int = 1600) -> bytes:
-    im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    w, h = im.size
-    if w > max_w:
-        r = max_w / float(w)
-        im = im.resize((int(w * r), int(h * r)))
-    out = io.BytesIO()
-    im.save(out, format="JPEG", quality=88)
-    return out.getvalue()
-
-def normalize_url(raw: str) -> str:
-    """
-    - 앞뒤 공백 제거
-    - 스킴이 없으면 https:// 자동 부여
-    - 내부에 공백이 있으면 제거(일부 QR리더 호환)
-    """
-    u = (raw or "").strip()
-    u = u.replace(" ", "")
-    if not u:
-        return ""
-    if not (u.lower().startswith("http://") or u.lower().startswith("https://")):
-        u = "https://" + u
-    return u
-
-def validate_url(u: str) -> Tuple[bool, str]:
-    """
-    단순 검증(현장용): 스킴/도메인 형태 정도만 체크.
-    """
-    if not u:
-        return False, "URL이 비어있습니다."
-    if not (u.lower().startswith("http://") or u.lower().startswith("https://")):
-        return False, "http:// 또는 https:// 로 시작해야 합니다."
-    # 최소 도메인 형태
-    if "://" in u:
-        host = u.split("://", 1)[1]
-        host = host.split("/", 1)[0]
-        if "." not in host and host.lower() != "localhost":
-            return False, "도메인/호스트 형식이 이상합니다(예: example.com)."
-    return True, ""
-
-def make_qr_png_bytes(url: str) -> bytes:
-    qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=2)
-    qr.add_data(url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    out = io.BytesIO()
-    img.save(out, format="PNG")
-    return out.getvalue()
-
-def save_bytes(path: Path, data: bytes):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-
-def make_zip(zip_path: Path, files: List[Path]) -> Path:
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            if f and f.exists():
-                zf.write(f, arcname=f.name)
-    return zip_path
+ensure_dirs()
 
 
 # =========================
 # 2) DB (SQLite)
 # =========================
-def db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+def db_connect():
+    con = sqlite3.connect(PATHS["DB"], check_same_thread=False)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    con.execute("PRAGMA busy_timeout=5000;")
     return con
 
 def db_init():
-    ensure_dirs()
     con = db_connect()
     cur = con.cursor()
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings(
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS meta (
+        k TEXT PRIMARY KEY,
+        v TEXT NOT NULL
     );
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS requests(
-      req_id TEXT PRIMARY KEY,
-      io_type TEXT NOT NULL,
-      site_name TEXT NOT NULL,
-      partner_company TEXT NOT NULL,
-      material_type TEXT NOT NULL,
-      vehicle_no TEXT NOT NULL,
-      driver_phone TEXT NOT NULL,
-      gate TEXT NOT NULL,
-      work_date TEXT NOT NULL,
-      work_time TEXT NOT NULL,
-      risk_level TEXT NOT NULL,
-      note TEXT,
-
-      requester_name TEXT NOT NULL,
-      requester_role TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-
-      status TEXT NOT NULL,
-      approved_by TEXT,
-      approved_at TEXT,
-      admin_sign_path TEXT,
-      stamp_path TEXT,
-      sic_url TEXT,
-
-      exec_by TEXT,
-      exec_at TEXT,
-      photo_dir TEXT,
-
-      checklist_json TEXT,
-      photos_json TEXT,
-      outputs_json TEXT
+    CREATE TABLE IF NOT EXISTS requests (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        site_name TEXT NOT NULL,
+        kind TEXT NOT NULL,              -- inbound/outbound
+        company_name TEXT NOT NULL,
+        item_name TEXT NOT NULL,
+        item_type TEXT NOT NULL,
+        work_type TEXT NOT NULL,
+        leader TEXT NOT NULL,
+        date TEXT NOT NULL,
+        time_from TEXT NOT NULL,
+        time_to TEXT NOT NULL,
+        gate TEXT NOT NULL,
+        vehicle_spec TEXT NOT NULL,
+        vehicle_count INTEGER NOT NULL,
+        pkg_json TEXT NOT NULL,
+        unload_place TEXT NOT NULL,
+        unload_method TEXT NOT NULL,
+        stack_place TEXT NOT NULL,
+        stack_method TEXT NOT NULL,
+        stack_height TEXT NOT NULL,
+        safety_json TEXT NOT NULL,
+        status TEXT NOT NULL,            -- REQUESTED/APPROVED/REJECTED/EXECUTING/DONE
+        requester_name TEXT NOT NULL,
+        requester_role TEXT NOT NULL,
+        approver_name TEXT,
+        approver_role TEXT,
+        approved_at TEXT,
+        reject_reason TEXT,
+        executed_at TEXT
     );
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS logs(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      req_id TEXT NOT NULL,
-      action TEXT NOT NULL,
-      actor TEXT NOT NULL,
-      actor_role TEXT NOT NULL,
-      detail TEXT,
-      created_at TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS photos (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        category TEXT NOT NULL,          -- required1/required2/required3/optional
+        created_at TEXT NOT NULL,
+        path TEXT NOT NULL,
+        uploaded_by TEXT NOT NULL
     );
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS checkcards (
+        request_id TEXT PRIMARY KEY,
+        json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        token TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        file_type TEXT NOT NULL,       -- plan/check/permit/zip
+        path TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """)
+
     con.commit()
+
+    # seed meta
+    def upsert_meta(k, v):
+        cur.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        con.commit()
+
+    cur.execute("SELECT v FROM meta WHERE k='site_pin'")
+    if cur.fetchone() is None:
+        upsert_meta("site_pin", SITE_PIN_DEFAULT)
+
+    cur.execute("SELECT v FROM meta WHERE k='admin_pin'")
+    if cur.fetchone() is None:
+        upsert_meta("admin_pin", ADMIN_PIN_DEFAULT)
+
+    cur.execute("SELECT v FROM meta WHERE k='visitor_training_url'")
+    if cur.fetchone() is None:
+        upsert_meta("visitor_training_url", DEFAULT_VISITOR_TRAINING_URL)
+
     con.close()
 
-def db_get_setting(key: str, default: str = "") -> str:
-    con = db_connect()
-    row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    con.close()
-    return row["value"] if row else default
+db_init()
 
-def db_set_setting(key: str, value: str):
-    con = db_connect()
-    con.execute(
-        "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (key, value, now_ts())
-    )
-    con.commit()
+def meta_get(k: str) -> str:
+    con = db_connect(); cur = con.cursor()
+    cur.execute("SELECT v FROM meta WHERE k=?", (k,))
+    row = cur.fetchone()
     con.close()
+    return row["v"] if row else ""
 
-def db_log(req_id: str, action: str, actor: str, actor_role: str, detail: str = ""):
-    con = db_connect()
-    con.execute(
-        "INSERT INTO logs(req_id,action,actor,actor_role,detail,created_at) VALUES(?,?,?,?,?,?)",
-        (req_id, action, actor, actor_role, safe_text(detail, 900), now_ts())
-    )
-    con.commit()
+def meta_set(k: str, v: str):
+    con = db_connect(); cur = con.cursor()
+    cur.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+    con.commit(); con.close()
+
+def req_insert(d: Dict[str, Any]):
+    con = db_connect(); cur = con.cursor()
+    cols = list(d.keys())
+    cur.execute(f"INSERT INTO requests ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", [d[c] for c in cols])
+    con.commit(); con.close()
+
+def req_update(req_id: str, fields: Dict[str, Any]):
+    con = db_connect(); cur = con.cursor()
+    sets = ", ".join([f"{k}=?" for k in fields.keys()])
+    cur.execute(f"UPDATE requests SET {sets} WHERE id=?", [*fields.values(), req_id])
+    con.commit(); con.close()
+
+def req_get(req_id: str) -> Optional[Dict[str, Any]]:
+    con = db_connect(); cur = con.cursor()
+    cur.execute("SELECT * FROM requests WHERE id=?", (req_id,))
+    row = cur.fetchone()
     con.close()
+    return dict(row) if row else None
 
-def db_insert_request(payload: Dict[str, Any]):
-    con = db_connect()
-    cols = ", ".join(payload.keys())
-    placeholders = ", ".join(["?"] * len(payload))
-    con.execute(f"INSERT INTO requests({cols}) VALUES({placeholders})", tuple(payload.values()))
-    con.commit()
-    con.close()
-
-def db_update_request(req_id: str, patch: Dict[str, Any]):
-    con = db_connect()
-    sets = ", ".join([f"{k}=?" for k in patch.keys()])
-    con.execute(f"UPDATE requests SET {sets} WHERE req_id=?", tuple(patch.values()) + (req_id,))
-    con.commit()
-    con.close()
-
-def db_get_request(req_id: str) -> Optional[sqlite3.Row]:
-    con = db_connect()
-    row = con.execute("SELECT * FROM requests WHERE req_id=?", (req_id,)).fetchone()
-    con.close()
-    return row
-
-def db_list_requests(status: Optional[str] = None, date_filter: Optional[str] = None, limit: int = 300) -> List[sqlite3.Row]:
-    con = db_connect()
-    q = "SELECT * FROM requests WHERE 1=1"
-    params = []
+def req_list(status: Optional[str]=None) -> List[Dict[str, Any]]:
+    con = db_connect(); cur = con.cursor()
     if status:
-        q += " AND status=?"
-        params.append(status)
-    if date_filter:
-        q += " AND work_date=?"
-        params.append(date_filter)
-    q += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-    rows = con.execute(q, tuple(params)).fetchall()
-    con.close()
-    return rows
-
-def db_get_logs(req_id: str, limit: int = 50) -> List[sqlite3.Row]:
-    con = db_connect()
-    rows = con.execute(
-        "SELECT * FROM logs WHERE req_id=? ORDER BY id DESC LIMIT ?",
-        (req_id, limit)
-    ).fetchall()
-    con.close()
-    return rows
-
-
-# =========================
-# 3) PDF HELPERS
-# =========================
-def _draw_box(c: canvas.Canvas, x, y, w, h, title: str = ""):
-    c.setStrokeColor(colors.HexColor("#D9DEE7"))
-    c.setLineWidth(1)
-    c.roundRect(x, y, w, h, 8, stroke=1, fill=0)
-    if title:
-        c.setFillColor(colors.HexColor("#111827"))
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(x + 8, y + h - 16, title)
-
-def _kv(c: canvas.Canvas, x, y, k: str, v: str, key_w: float = 70):
-    c.setFont("Helvetica-Bold", 9)
-    c.setFillColor(colors.HexColor("#374151"))
-    c.drawString(x, y, k)
-    c.setFont("Helvetica", 10)
-    c.setFillColor(colors.HexColor("#111827"))
-    c.drawString(x + key_w, y, safe_text(v, 70))
-
-def pdf_approval(req: sqlite3.Row) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    c.setFillColor(colors.HexColor("#0B5FFF"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(24*mm, H - 22*mm, f"자재 반출입 승인서 ({'반입' if req['io_type']=='IN' else '반출'})")
-
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.setFont("Helvetica", 9)
-    c.drawString(24*mm, H - 28*mm, f"REQ ID: {req['req_id']}  |  생성: {req['created_at']}  |  v{APP_VERSION}")
-
-    _draw_box(c, 20*mm, H - 92*mm, W - 40*mm, 58*mm, "신청 정보")
-    y = H - 54*mm
-    _kv(c, 26*mm, y, "협력사", req["partner_company"])
-    _kv(c, 105*mm, y, "자재", req["material_type"])
-    y -= 14
-    _kv(c, 26*mm, y, "차량번호", req["vehicle_no"])
-    _kv(c, 105*mm, y, "운전원", req["driver_phone"])
-    y -= 14
-    _kv(c, 26*mm, y, "GATE", req["gate"])
-    _kv(c, 105*mm, y, "일시", f"{req['work_date']} {req['work_time']}")
-    y -= 14
-    _kv(c, 26*mm, y, "위험도", req["risk_level"])
-    _kv(c, 105*mm, y, "비고", req["note"] or "-")
-
-    _draw_box(c, 20*mm, H - 155*mm, W - 40*mm, 50*mm, "결재")
-    c.setFont("Helvetica", 10)
-    c.setFillColor(colors.HexColor("#111827"))
-    c.drawString(26*mm, H - 124*mm, f"기안: {req['requester_name']} ({req['requester_role']})")
-    c.drawString(26*mm, H - 138*mm, f"결재: {req['approved_by'] or '-'}   |   결재시각: {req['approved_at'] or '-'}")
-
-    sx = 145*mm
-    sy = H - 150*mm
-    sign_path = req["admin_sign_path"]
-    stamp_path = req["stamp_path"]
-
-    if stamp_path and Path(stamp_path).exists():
-        try:
-            img = Image.open(stamp_path).convert("RGBA")
-            tmp = io.BytesIO()
-            img.save(tmp, format="PNG")
-            tmp.seek(0)
-            c.drawImage(tmp, sx, sy, width=24*mm, height=24*mm, mask="auto")
-        except Exception:
-            pass
-
-    if sign_path and Path(sign_path).exists():
-        try:
-            img = Image.open(sign_path).convert("RGBA")
-            tmp = io.BytesIO()
-            img.save(tmp, format="PNG")
-            tmp.seek(0)
-            c.drawImage(tmp, sx + 28*mm, sy, width=40*mm, height=18*mm, mask="auto")
-        except Exception:
-            pass
-
-    c.setFont("Helvetica", 8)
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.drawString(20*mm, 18*mm, "본 문서는 현장 운영 Tool에서 자동 생성되었습니다. (대장에서 승인/실행/사진 이력 확인)")
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-def pdf_permit_with_qr(req: sqlite3.Row, sic_url: str) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    c.setFillColor(colors.HexColor("#111827"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(24*mm, H - 22*mm, "자재 차량 진출입 허가증 (QR 포함)")
-
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.setFont("Helvetica", 9)
-    c.drawString(24*mm, H - 28*mm, f"REQ ID: {req['req_id']}  |  {req['work_date']} {req['work_time']}")
-
-    _draw_box(c, 20*mm, H - 92*mm, W - 40*mm, 58*mm, "기본 정보")
-    y = H - 54*mm
-    _kv(c, 26*mm, y, "구분", "반입" if req["io_type"] == "IN" else "반출")
-    _kv(c, 105*mm, y, "협력사", req["partner_company"])
-    y -= 14
-    _kv(c, 26*mm, y, "차량번호", req["vehicle_no"])
-    _kv(c, 105*mm, y, "운전원", req["driver_phone"])
-    y -= 14
-    _kv(c, 26*mm, y, "GATE", req["gate"])
-    _kv(c, 105*mm, y, "자재", req["material_type"])
-
-    _draw_box(c, 20*mm, H - 170*mm, W - 40*mm, 65*mm, "필수 준수사항(요약)")
-    rules = [
-        "현장 내 속도 10km/h 이내",
-        "유도원 통제 준수",
-        "상/하차 구간 통제 후 작업",
-        "비상등 점등 및 안전모 착용",
-        "주정차 시 고임목 설치",
-        "낙하/전도 위험요소 즉시 조치",
-    ]
-    c.setFont("Helvetica", 10)
-    c.setFillColor(colors.HexColor("#111827"))
-    yy = H - 132*mm
-    for i, r in enumerate(rules, 1):
-        c.drawString(26*mm, yy, f"{i}. {r}")
-        yy -= 12
-
-    qr_bytes = make_qr_png_bytes(sic_url)
-    qr_img = Image.open(io.BytesIO(qr_bytes)).convert("RGB")
-    tmp = io.BytesIO()
-    qr_img.save(tmp, format="PNG")
-    tmp.seek(0)
-
-    _draw_box(c, 20*mm, 35*mm, 70*mm, 70*mm, "방문자교육 QR")
-    c.drawImage(tmp, 27*mm, 44*mm, width=56*mm, height=56*mm)
-    c.setFont("Helvetica", 8)
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.drawString(24*mm, 28*mm, f"URL: {sic_url}")
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-def pdf_checkcard(req: sqlite3.Row, checklist: Dict[str, Any]) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    c.setFillColor(colors.HexColor("#111827"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(24*mm, H - 22*mm, "자재 상/하차 점검카드")
-
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.setFont("Helvetica", 9)
-    c.drawString(24*mm, H - 28*mm, f"REQ ID: {req['req_id']}  |  {req['work_date']} {req['work_time']}")
-
-    _draw_box(c, 20*mm, H - 85*mm, W - 40*mm, 45*mm, "기본 정보")
-    y = H - 50*mm
-    _kv(c, 26*mm, y, "협력사", req["partner_company"])
-    _kv(c, 105*mm, y, "자재", req["material_type"])
-    y -= 14
-    _kv(c, 26*mm, y, "차량번호", req["vehicle_no"])
-    _kv(c, 105*mm, y, "GATE", req["gate"])
-
-    _draw_box(c, 20*mm, H - 265*mm, W - 40*mm, 170*mm, "점검 항목")
-    items = [
-        ("0. 필수 참석자", checklist.get("attendees", "-")),
-        ("1. 협력회사", checklist.get("partner_company", "-")),
-        ("2. 화물/자재 종류", checklist.get("cargo_type", "-")),
-        ("3. 결속 2개소 이상", checklist.get("check_3", "-")),
-        ("4. 로프/밴딩 점검", checklist.get("check_4", "-")),
-        ("5. 4M 이하/낙하위험", checklist.get("check_5", "-")),
-        ("6. 폭초과 금지/닫힘", checklist.get("check_6", "-")),
-        ("7. 고임목 설치", checklist.get("check_7", "-")),
-        ("8. 적재하중 이내", checklist.get("check_8", "-")),
-        ("9. 무게중심(쏠림)", checklist.get("check_9", "-")),
-        ("10. 구획/통제", checklist.get("check_10", "-")),
-    ]
-    yy = H - 110*mm
-    for k, v in items:
-        c.setFont("Helvetica-Bold", 9)
-        c.setFillColor(colors.HexColor("#111827"))
-        c.drawString(26*mm, yy, k)
-        c.setFont("Helvetica", 10)
-        c.drawString(85*mm, yy, safe_text(v, 70))
-        yy -= 14
-        if yy < 40*mm:
-            c.showPage()
-            yy = H - 30*mm
-
-    c.setFont("Helvetica", 9)
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.drawString(20*mm, 18*mm, "본 점검카드는 현장 운영 Tool에서 자동 생성되었습니다.")
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-def pdf_exec_photos(req: sqlite3.Row, photos: List[Dict[str, str]]) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    c.setFillColor(colors.HexColor("#111827"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(24*mm, H - 22*mm, "실행 사진 기록")
-
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.setFont("Helvetica", 9)
-    c.drawString(24*mm, H - 28*mm, f"REQ ID: {req['req_id']}  |  실행: {req['exec_at'] or '-'}  |  담당: {req['exec_by'] or '-'}")
-
-    y = H - 42*mm
-    for idx, p in enumerate(photos, 1):
-        path = p.get("path", "")
-        label = p.get("label", f"사진 {idx}")
-        if not path or not Path(path).exists():
-            continue
-
-        _draw_box(c, 20*mm, y - 75*mm, W - 40*mm, 70*mm, f"{idx}. {label}")
-        try:
-            im = Image.open(path).convert("RGB")
-            max_w = (W - 52*mm)
-            max_h = 55*mm
-            iw, ih = im.size
-            ratio = min(max_w / iw, max_h / ih)
-            draw_w, draw_h = iw * ratio, ih * ratio
-            tmp = io.BytesIO()
-            im.save(tmp, format="JPEG", quality=85)
-            tmp.seek(0)
-            c.drawImage(tmp, 26*mm, y - 68*mm, width=draw_w, height=draw_h)
-        except Exception:
-            c.setFont("Helvetica", 10)
-            c.setFillColor(colors.red)
-            c.drawString(26*mm, y - 58*mm, f"이미지 로드 실패: {path}")
-
-        y -= 82*mm
-        if y < 50*mm:
-            c.showPage()
-            y = H - 25*mm
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-def pdf_packet_light(req: sqlite3.Row, sic_url: str) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    c.setFillColor(colors.HexColor("#0B5FFF"))
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(24*mm, H - 22*mm, "PACKET (승인)")
-
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.setFont("Helvetica", 9)
-    c.drawString(24*mm, H - 28*mm, f"REQ ID: {req['req_id']}  |  생성: {now_ts()}  |  v{APP_VERSION}")
-
-    _draw_box(c, 20*mm, H - 105*mm, W - 40*mm, 70*mm, "요약")
-    y = H - 58*mm
-    _kv(c, 26*mm, y, "구분", "반입" if req["io_type"] == "IN" else "반출")
-    _kv(c, 105*mm, y, "협력사", req["partner_company"])
-    y -= 14
-    _kv(c, 26*mm, y, "자재", req["material_type"])
-    _kv(c, 105*mm, y, "차량", req["vehicle_no"])
-    y -= 14
-    _kv(c, 26*mm, y, "GATE", req["gate"])
-    _kv(c, 105*mm, y, "일시", f"{req['work_date']} {req['work_time']}")
-    y -= 14
-    _kv(c, 26*mm, y, "결재", f"{req['approved_by'] or '-'} / {req['approved_at'] or '-'}")
-    _kv(c, 105*mm, y, "위험도", req["risk_level"])
-
-    qr_bytes = make_qr_png_bytes(sic_url)
-    qr_img = Image.open(io.BytesIO(qr_bytes)).convert("RGB")
-    tmp = io.BytesIO()
-    qr_img.save(tmp, format="PNG")
-    tmp.seek(0)
-
-    _draw_box(c, 20*mm, 35*mm, 70*mm, 70*mm, "방문자교육 QR")
-    c.drawImage(tmp, 27*mm, 44*mm, width=56*mm, height=56*mm)
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-def pdf_packet_full(req: sqlite3.Row, sic_url: str, checklist: Dict[str, Any], photos: List[Dict[str, str]]) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    c.setFillColor(colors.HexColor("#0B5FFF"))
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(24*mm, H - 22*mm, "PACKET (실행 완료)")
-
-    c.setFillColor(colors.HexColor("#6B7280"))
-    c.setFont("Helvetica", 9)
-    c.drawString(24*mm, H - 28*mm, f"REQ ID: {req['req_id']}  |  생성: {now_ts()}  |  v{APP_VERSION}")
-
-    _draw_box(c, 20*mm, H - 115*mm, W - 40*mm, 80*mm, "요약")
-    y = H - 58*mm
-    _kv(c, 26*mm, y, "구분", "반입" if req["io_type"] == "IN" else "반출")
-    _kv(c, 105*mm, y, "협력사", req["partner_company"])
-    y -= 14
-    _kv(c, 26*mm, y, "자재", req["material_type"])
-    _kv(c, 105*mm, y, "차량", req["vehicle_no"])
-    y -= 14
-    _kv(c, 26*mm, y, "GATE", req["gate"])
-    _kv(c, 105*mm, y, "일시", f"{req['work_date']} {req['work_time']}")
-    y -= 14
-    _kv(c, 26*mm, y, "결재", f"{req['approved_by'] or '-'} / {req['approved_at'] or '-'}")
-    _kv(c, 105*mm, y, "실행", f"{req['exec_by'] or '-'} / {req['exec_at'] or '-'}")
-    y -= 14
-    _kv(c, 26*mm, y, "위험도", req["risk_level"])
-    _kv(c, 105*mm, y, "비고", req["note"] or "-")
-
-    qr_bytes = make_qr_png_bytes(sic_url)
-    qr_img = Image.open(io.BytesIO(qr_bytes)).convert("RGB")
-    tmp = io.BytesIO()
-    qr_img.save(tmp, format="PNG")
-    tmp.seek(0)
-
-    _draw_box(c, 20*mm, 35*mm, 70*mm, 70*mm, "방문자교육 QR")
-    c.drawImage(tmp, 27*mm, 44*mm, width=56*mm, height=56*mm)
-
-    c.showPage()
-
-    c.setFillColor(colors.HexColor("#111827"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(24*mm, H - 22*mm, "점검카드 요약")
-
-    items = [
-        ("0. 참석자", checklist.get("attendees", "-")),
-        ("3. 결속", checklist.get("check_3", "-")),
-        ("4. 로프/밴딩", checklist.get("check_4", "-")),
-        ("5. 4M 이하/낙하", checklist.get("check_5", "-")),
-        ("6. 폭초과/닫힘", checklist.get("check_6", "-")),
-        ("7. 고임목", checklist.get("check_7", "-")),
-        ("8. 적재하중", checklist.get("check_8", "-")),
-        ("9. 무게중심", checklist.get("check_9", "-")),
-        ("10. 구획/통제", checklist.get("check_10", "-")),
-    ]
-    _draw_box(c, 20*mm, H - 270*mm, W - 40*mm, 230*mm, "")
-    yy = H - 52*mm
-    for k, v in items:
-        c.setFont("Helvetica-Bold", 10)
-        c.setFillColor(colors.HexColor("#111827"))
-        c.drawString(26*mm, yy, k)
-        c.setFont("Helvetica", 10)
-        c.drawString(80*mm, yy, safe_text(v, 70))
-        yy -= 16
-
-    c.showPage()
-
-    c.setFillColor(colors.HexColor("#111827"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(24*mm, H - 22*mm, "실행 사진")
-
-    y = H - 42*mm
-    for idx, p in enumerate(photos, 1):
-        path = p.get("path", "")
-        label = p.get("label", f"사진 {idx}")
-        if not path or not Path(path).exists():
-            continue
-
-        _draw_box(c, 20*mm, y - 75*mm, W - 40*mm, 70*mm, f"{idx}. {label}")
-        try:
-            im = Image.open(path).convert("RGB")
-            max_w = (W - 52*mm)
-            max_h = 55*mm
-            iw, ih = im.size
-            ratio = min(max_w / iw, max_h / ih)
-            draw_w, draw_h = iw * ratio, ih * ratio
-            tmp = io.BytesIO()
-            im.save(tmp, format="JPEG", quality=85)
-            tmp.seek(0)
-            c.drawImage(tmp, 26*mm, y - 68*mm, width=draw_w, height=draw_h)
-        except Exception:
-            c.setFont("Helvetica", 10)
-            c.setFillColor(colors.red)
-            c.drawString(26*mm, y - 58*mm, f"이미지 로드 실패: {path}")
-
-        y -= 82*mm
-        if y < 50*mm:
-            c.showPage()
-            c.setFillColor(colors.HexColor("#111827"))
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(24*mm, H - 22*mm, "실행 사진(계속)")
-            y = H - 42*mm
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-# =========================
-# 4) AUTH / SESSION (A안) + QR Preview
-# =========================
-def render_login_panel():
-    st.session_state.setdefault("auth_ok", False)
-    st.session_state.setdefault("is_admin", False)
-    st.session_state.setdefault("user_name", "")
-    st.session_state.setdefault("user_role", "공무")
-
-    saved = db_get_setting("sic_url", DEFAULT_SIC_URL)
-    st.session_state.setdefault("sic_url", saved)
-
-    st.session_state.setdefault(
-        "photo_roles",
-        set(json.loads(db_get_setting("photo_roles", json.dumps(list(PHOTO_ROLES_DEFAULT)))))
-    )
-    st.session_state.setdefault("login_error", "")
-
-    st.markdown("## 🔐 로그인(현장용)")
-
-    with st.form("login_form", clear_on_submit=False):
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            site_pin = st.text_input("현장 PIN*", type="password", placeholder="예) 4자리")
-            user_name = st.text_input("이름/직책*", placeholder="예) 공무팀장 홍길동")
-            role = st.selectbox("역할*", ROLE_OPTIONS, index=ROLE_OPTIONS.index(st.session_state.get("user_role", "공무")))
-        with col2:
-            admin_pin = ""
-            if role == "관리자":
-                admin_pin = st.text_input("Admin PIN*", type="password", placeholder="관리자 전용 PIN")
-                st.caption("관리자 역할은 Admin PIN이 필수입니다.")
-
-            sic_url_raw = st.text_input("방문자교육 URL(QR)*", value=st.session_state.get("sic_url", DEFAULT_SIC_URL))
-
-        ok = st.form_submit_button("로그인")
-
-    # ✅ QR/링크 미리보기(로그인 전에도 확인 가능)
-    sic_url_preview = normalize_url(st.session_state.get("sic_url", DEFAULT_SIC_URL))
-    sic_url_preview = normalize_url(sic_url_raw) if 'sic_url_raw' in locals() else sic_url_preview
-    valid, msg = validate_url(sic_url_preview)
-
-    st.markdown("### 🔎 QR 미리보기/테스트")
-    if not valid:
-        st.warning(f"현재 URL 형식 경고: {msg}")
-    if sic_url_preview:
-        st.write("테스트 링크(눌러서 열기):")
-        st.link_button("방문자교육 링크 열기", sic_url_preview)
-        st.image(make_qr_png_bytes(sic_url_preview), caption=sic_url_preview, width=220)
-        st.caption("※ QR이 안 열리면: (1) 이 링크가 휴대폰에서 직접 열리는지부터 확인하세요. 안 열리면 '망/보안' 문제일 가능성이 큽니다.")
+        cur.execute("SELECT * FROM requests WHERE status=? ORDER BY created_at DESC", (status,))
     else:
-        st.info("방문자교육 URL을 입력하면 QR 미리보기가 표시됩니다.")
+        cur.execute("SELECT * FROM requests ORDER BY created_at DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
 
-    if ok:
-        if not verify_pin(site_pin, SITE_PIN_H):
-            st.session_state["auth_ok"] = False
-            st.session_state["is_admin"] = False
-            st.session_state["login_error"] = "현장 PIN이 올바르지 않습니다."
-            return
+def photo_add(req_id: str, category: str, path: str, uploaded_by: str):
+    con = db_connect(); cur = con.cursor()
+    cur.execute("""
+      INSERT INTO photos(id,request_id,category,created_at,path,uploaded_by)
+      VALUES(?,?,?,?,?,?)
+    """, (str(uuid.uuid4()), req_id, category, now(), path, uploaded_by))
+    con.commit(); con.close()
 
-        if not safe_text(user_name, 60):
-            st.session_state["auth_ok"] = False
-            st.session_state["is_admin"] = False
-            st.session_state["login_error"] = "이름/직책을 입력해주세요."
-            return
+def photo_list(req_id: str) -> List[Dict[str, Any]]:
+    con = db_connect(); cur = con.cursor()
+    cur.execute("SELECT * FROM photos WHERE request_id=? ORDER BY created_at ASC", (req_id,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
 
-        if role == "관리자":
-            if not verify_pin(admin_pin, ADMIN_PIN_H):
-                st.session_state["auth_ok"] = False
-                st.session_state["is_admin"] = False
-                st.session_state["login_error"] = "Admin PIN이 올바르지 않습니다."
-                return
+def checkcard_upsert(req_id: str, data: Dict[str, Any]):
+    con = db_connect(); cur = con.cursor()
+    cur.execute("""
+      INSERT INTO checkcards(request_id,json,updated_at)
+      VALUES(?,?,?)
+      ON CONFLICT(request_id) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at
+    """, (req_id, json.dumps(data, ensure_ascii=False), now()))
+    con.commit(); con.close()
 
-        # ✅ 저장 시 URL 정규화
-        sic_url = normalize_url(sic_url_raw) or normalize_url(DEFAULT_SIC_URL)
-        st.session_state["sic_url"] = sic_url
-        db_set_setting("sic_url", sic_url)
+def checkcard_get(req_id: str) -> Dict[str, Any]:
+    con = db_connect(); cur = con.cursor()
+    cur.execute("SELECT json FROM checkcards WHERE request_id=?", (req_id,))
+    row = cur.fetchone()
+    con.close()
+    if not row: return {}
+    try: return json.loads(row["json"])
+    except: return {}
 
-        st.session_state["auth_ok"] = True
-        st.session_state["user_name"] = safe_text(user_name, 60)
-        st.session_state["user_role"] = role
-        st.session_state["is_admin"] = (role == "관리자")
-        st.session_state["login_error"] = ""
-        st.rerun()
+def file_token_upsert(token: str, req_id: str, file_type: str, path: str):
+    con = db_connect(); cur = con.cursor()
+    cur.execute("""
+      INSERT INTO files(token,request_id,file_type,path,created_at)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(token) DO UPDATE SET path=excluded.path, created_at=excluded.created_at
+    """, (token, req_id, file_type, path, now()))
+    con.commit(); con.close()
 
-    if st.session_state.get("login_error"):
-        st.error(st.session_state["login_error"])
+def file_by_token(token: str) -> Optional[Dict[str, Any]]:
+    con = db_connect(); cur = con.cursor()
+    cur.execute("SELECT * FROM files WHERE token=?", (token,))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
 
-def require_login():
-    if not st.session_state.get("auth_ok"):
-        render_login_panel()
-        st.stop()
-
-def require_admin():
-    require_login()
-    if not st.session_state.get("is_admin"):
-        st.error("이 기능은 관리자만 사용할 수 있습니다. (역할=관리자 + Admin PIN)")
-        st.stop()
-
-def can_upload_photos() -> bool:
-    role = st.session_state.get("user_role", "")
-    allowed = st.session_state.get("photo_roles", PHOTO_ROLES_DEFAULT)
-    return role in allowed
-
-
-# =========================
-# 5) UI
-# =========================
-def inject_css():
-    st.markdown(
-        """
-        <style>
-        .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1100px; }
-        .card {
-          background: #ffffff;
-          border: 1px solid #E5E7EB;
-          border-radius: 16px;
-          padding: 14px 14px;
-          box-shadow: 0 10px 30px rgba(17,24,39,0.06);
-        }
-        .h1 { font-size: 20px; font-weight: 900; color:#0B5FFF; }
-        .h2 { font-size: 16px; font-weight: 900; color:#111827; }
-        .muted { color:#6B7280; font-size:12px; }
-        .pill { display:inline-block; padding:4px 10px; border-radius:999px; font-size:12px;
-                border:1px solid #E5E7EB; background:#F9FAFB; color:#111827; margin-right:6px; }
-        .hr { height:1px; background:#E5E7EB; margin:12px 0; }
-        @media (max-width: 600px) {
-          .block-container { padding-left: 0.9rem; padding-right: 0.9rem; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-def header_area():
-    st.markdown(f"<div class='h1'>{APP_TITLE}</div>", unsafe_allow_html=True)
-    st.caption(f"v{APP_VERSION} | 저장/산출 루트: {BASE}")
-
-def sidebar_area():
-    with st.sidebar:
-        st.markdown("### 👤 사용자")
-        st.write(f"**{st.session_state.get('user_name','-')}**")
-        st.write(f"역할: **{st.session_state.get('user_role','-')}**")
-        st.write(f"관리자: {'✅' if st.session_state.get('is_admin') else '—'}")
-
-        st.markdown("---")
-        st.markdown("### 📁 산출물 위치")
-        st.code(
-            f"BASE: {BASE}\n"
-            f"DB:   {DB_PATH}\n"
-            f"PDF:  {BASE}/output/pdf\n"
-            f"PACKET:{BASE}/output/packet\n"
-            f"CHECK:{BASE}/output/check\n"
-            f"PHOTO:{BASE}/output/photos\n"
-            f"SIGN: {BASE}/output/sign\n"
-            f"ZIP:  {BASE}/output/zip"
-        )
-        if SHARE_UNC:
-            st.caption(f"UNC(공유경로): {SHARE_UNC}")
-
-        with st.expander("⚙️ 운영 설정(관리자)", expanded=False):
-            if st.session_state.get("is_admin"):
-                st.markdown("**사진 업로드 허용 역할**")
-                roles = st.multiselect("허용 역할", ROLE_OPTIONS, default=sorted(list(st.session_state.get("photo_roles", PHOTO_ROLES_DEFAULT))))
-                if st.button("저장(권한)"):
-                    st.session_state["photo_roles"] = set(roles)
-                    db_set_setting("photo_roles", json.dumps(list(roles), ensure_ascii=False))
-                    st.success("저장했습니다.")
-            else:
-                st.info("관리자만 설정 가능합니다.")
+def files_for_request(req_id: str) -> List[Dict[str, Any]]:
+    con = db_connect(); cur = con.cursor()
+    cur.execute("SELECT * FROM files WHERE request_id=? ORDER BY created_at DESC", (req_id,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
 
 
 # =========================
-# 6) WORKFLOW PAGES
+# 3) Utilities
 # =========================
-def make_req_id(io_type: str) -> str:
-    return f"REQ_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{io_type}"
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def kpi_area():
-    today = date.today().strftime("%Y-%m-%d")
-    rows = db_list_requests(date_filter=today, limit=999)
-    def cnt(s): return sum(1 for r in rows if r["status"] == s)
-    pending, approved, executed = cnt("PENDING"), cnt("APPROVED"), cnt("EXECUTED")
-    high = sum(1 for r in rows if r["risk_level"] == "HIGH")
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown(f"<span class='pill'>오늘 요청 {len(rows)}건</span>"
-                f"<span class='pill'>대기 {pending}건</span>"
-                f"<span class='pill'>승인 {approved}건</span>"
-                f"<span class='pill'>실행 {executed}건</span>"
-                f"<span class='pill'>고위험 {high}건</span>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+def safe_filename(s: str) -> str:
+    s = re.sub(r"[^\w\-\.\(\)\[\]\s가-힣]", "_", s)
+    s = re.sub(r"\s+", "_", s).strip("_")
+    return s[:120] if s else "file"
 
-def page_home():
-    kpi_area()
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+def make_token(req_id: str, file_type: str) -> str:
+    raw = f"{req_id}:{file_type}:{time.time()}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:18]
 
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h2'>진행 카드</div>", unsafe_allow_html=True)
-    st.markdown("<div class='muted'>버튼을 누르면 해당 화면으로 이동합니다.</div>", unsafe_allow_html=True)
+def public_file_url(token: str) -> str:
+    return f"{PUBLIC_BASE_URL}/f/{token}"
 
-    col1, col2, col3 = st.columns(3)
-    if col1.button("1) 신청"):
-        st.session_state["page"] = "신청"
-        st.rerun()
-    if col2.button("3) 승인(관리자)"):
-        st.session_state["page"] = "승인"
-        st.rerun()
-    if col3.button("6) 실행 등록"):
-        st.session_state["page"] = "실행"
-        st.rerun()
+def embed_pdf(path: str, height: int = 680):
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    html = f"""
+    <iframe src="data:application/pdf;base64,{b64}"
+            width="100%" height="{height}"
+            style="border:1px solid #E5E7EB;border-radius:14px;background:white;">
+    </iframe>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
-    col4, col5, col6 = st.columns(3)
-    if col4.button("5) 게이트 확인"):
-        st.session_state["page"] = "게이트"
-        st.rerun()
-    if col5.button("7) 대장"):
-        st.session_state["page"] = "대장"
-        st.rerun()
-    if col6.button("로그아웃"):
-        st.session_state.clear()
-        st.rerun()
+def save_uploads(req_id: str, files, subdir: str) -> List[str]:
+    saved = []
+    base = p(PATHS["PHOTOS"], req_id, subdir)
+    os.makedirs(base, exist_ok=True)
+    for f in files:
+        name = safe_filename(f.name)
+        out = p(base, f"{int(time.time())}_{name}")
+        with open(out, "wb") as wf:
+            wf.write(f.getbuffer())
+        saved.append(out)
+    return saved
 
-    st.markdown("</div>", unsafe_allow_html=True)
 
-def page_apply():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h2'>1) 반입/반출 신청</div>", unsafe_allow_html=True)
-    st.caption("입력 후 저장하면 PENDING(대기)로 등록됩니다.")
+# =========================
+# 4) PDF generators
+# =========================
+def _draw_header(c: canvas.Canvas, title: str, sub: str=""):
+    c.setFillColor(colors.HexColor("#0B5FFF"))
+    c.rect(0, A4[1]-22*mm, A4[0], 22*mm, stroke=0, fill=1)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(15*mm, A4[1]-14*mm, title)
+    c.setFont("Helvetica", 10)
+    if sub:
+        c.drawString(15*mm, A4[1]-19*mm, sub)
 
-    with st.form("apply_form", clear_on_submit=False):
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            io_kor = st.selectbox("구분*", ["반입", "반출"])
-            partner = st.text_input("협력회사*", placeholder="예) ㈜OOO")
-            material = st.text_input("화물/자재 종류*", placeholder="예) 철근/고철/덕트 등")
-            vehicle_no = st.text_input("차량번호*", placeholder="예) 80가1234")
-            driver_phone = st.text_input("운전원 연락처*", placeholder="예) 010-1234-5678")
-        with col2:
-            site_name = st.text_input("현장명*", value="현장명(수정)")
-            gate = st.text_input("사용 GATE*", placeholder="예) 1GATE")
-            work_date = st.date_input("일자*", value=date.today()).strftime("%Y-%m-%d")
-            work_time = st.time_input("시간*", value=datetime.now().replace(second=0, microsecond=0).time()).strftime("%H:%M")
-            risk = st.selectbox("위험도*", ["LOW", "MID", "HIGH"], index=1)
-            note = st.text_area("비고", placeholder="특이사항/주의사항(선택)", height=90)
+def pdf_plan(req: Dict[str, Any], out_path: str):
+    kind_label = "반입" if req["kind"] == "inbound" else "반출"
+    c = canvas.Canvas(out_path, pagesize=A4)
+    _draw_header(c, f"자재 반출입 계획서 ({kind_label})", f"요청ID: {req['id']}  /  생성: {now()}")
 
-        submit = st.form_submit_button("신청 저장(PENDING)", type="primary")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if submit:
-        if not (partner and material and vehicle_no and driver_phone and gate and site_name):
-            st.error("필수 항목(*)을 모두 입력해주세요.")
-            return
-
-        io_type = "IN" if io_kor == "반입" else "OUT"
-        req_id = make_req_id(io_type)
-
-        sic_url = normalize_url(st.session_state.get("sic_url", DEFAULT_SIC_URL)) or normalize_url(DEFAULT_SIC_URL)
-
-        payload = dict(
-            req_id=req_id,
-            io_type=io_type,
-            site_name=safe_text(site_name, 80),
-            partner_company=safe_text(partner, 120),
-            material_type=safe_text(material, 200),
-            vehicle_no=safe_text(vehicle_no, 50),
-            driver_phone=safe_text(driver_phone, 50),
-            gate=safe_text(gate, 50),
-            work_date=work_date,
-            work_time=work_time,
-            risk_level=risk,
-            note=safe_text(note, 600),
-
-            requester_name=st.session_state["user_name"],
-            requester_role=st.session_state["user_role"],
-            created_at=now_ts(),
-
-            status="PENDING",
-            approved_by=None,
-            approved_at=None,
-            admin_sign_path=None,
-            stamp_path=None,
-            sic_url=sic_url,
-
-            exec_by=None,
-            exec_at=None,
-            photo_dir=None,
-
-            checklist_json=None,
-            photos_json=None,
-            outputs_json=json.dumps({}, ensure_ascii=False),
-        )
-
-        db_insert_request(payload)
-        db_log(req_id, "CREATE_REQUEST", st.session_state["user_name"], st.session_state["user_role"], f"{io_kor} 신청")
-
-        st.success(f"신청 저장 완료! (REQ ID: {req_id})")
-
-        msg = (
-            f"[자재 {('반입' if io_type=='IN' else '반출')} 요청]\n"
-            f"- REQ: {req_id}\n"
-            f"- 협력사: {partner}\n"
-            f"- 자재: {material}\n"
-            f"- 차량: {vehicle_no} / {driver_phone}\n"
-            f"- GATE: {gate}\n"
-            f"- 일시: {work_date} {work_time}\n"
-            f"- 위험도: {risk}\n"
-            f"(관리자 승인 후 PACKET(PDF) 업로드 예정)"
-        )
-        st.text_area("📌 단톡 공유 문구(복사해서 전송)", value=msg, height=160)
-
-def page_approve():
-    require_admin()
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h2'>3) 승인(관리자)</div>", unsafe_allow_html=True)
-    st.caption("PENDING 선택 → (도장/서명 옵션) → APPROVED + PACKET_LIGHT 생성")
-
-    pending = db_list_requests(status="PENDING", limit=300)
-    if not pending:
-        st.info("승인 대기(PENDING) 건이 없습니다.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
-    options = [
-        f"{r['req_id']} | {r['partner_company']} | {r['material_type']} | {r['work_date']} {r['work_time']} | {r['gate']} | {r['risk_level']}"
-        for r in pending
+    basic = [
+        ["회사명", req["company_name"], "공종", req["work_type"]],
+        ["취급 자재/도구명", req["item_name"], "작업 지휘자", req["leader"]],
+        ["일자", req["date"], "시간", f"{req['time_from']} ~ {req['time_to']}"],
+        ["사용 GATE", req["gate"], "운반 차량 규격/대수", f"{req['vehicle_spec']} / {req['vehicle_count']}대"],
     ]
-    sel = st.selectbox("승인 대상 선택", options)
-    req_id = sel.split(" | ")[0]
-    req = db_get_request(req_id)
+    t = Table(basic, colWidths=[28*mm, 62*mm, 28*mm, 62*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(0,-1),colors.whitesmoke),
+        ("BACKGROUND",(2,0),(2,-1),colors.whitesmoke),
+        ("BOX",(0,0),(-1,-1),0.8,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.5,colors.lightgrey),
+        ("FONT",(0,0),(-1,-1),"Helvetica",9),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("LEFTPADDING",(0,0),(-1,-1),6),
+        ("RIGHTPADDING",(0,0),(-1,-1),6),
+        ("TOPPADDING",(0,0),(-1,-1),6),
+        ("BOTTOMPADDING",(0,0),(-1,-1),6),
+    ]))
+    t.wrapOn(c, 0, 0)
+    t.drawOn(c, 15*mm, A4[1]-55*mm)
 
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-    st.write(f"**REQ:** {req_id}")
-    st.write(f"- 협력사: {req['partner_company']} / 자재: {req['material_type']}")
-    st.write(f"- 차량: {req['vehicle_no']} / {req['driver_phone']}")
-    st.write(f"- GATE: {req['gate']} / 일시: {req['work_date']} {req['work_time']}")
-    st.write(f"- 위험도: {req['risk_level']}")
+    pkg = json.loads(req["pkg_json"])
+    pkg_rows = [["항목명", "크기(WxDxH)", "총 무게", "PKG당 무게/개수", "총 PKG 수", "결속 방법", "적재 높이/단"]]
+    for r in pkg:
+        pkg_rows.append([
+            r.get("name",""), r.get("size",""), r.get("total_weight",""),
+            r.get("pkg_weight",""), r.get("pkg_count",""), r.get("binding",""), r.get("stack","")
+        ])
+    tp = Table(pkg_rows, colWidths=[26*mm, 26*mm, 20*mm, 28*mm, 18*mm, 28*mm, 28*mm])
+    tp.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EAF2FF")),
+        ("BOX",(0,0),(-1,-1),0.8,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.5,colors.lightgrey),
+        ("FONT",(0,0),(-1,-1),"Helvetica",8.5),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("LEFTPADDING",(0,0),(-1,-1),4),
+        ("RIGHTPADDING",(0,0),(-1,-1),4),
+        ("TOPPADDING",(0,0),(-1,-1),4),
+        ("BOTTOMPADDING",(0,0),(-1,-1),4),
+    ]))
+    tp.wrapOn(c, 0, 0)
+    tp.drawOn(c, 15*mm, A4[1]-105*mm)
 
-    st.markdown("### 🔗 방문자교육 URL(QR)")
-    sic_input = st.text_input("SIC 방문자교육 URL", value=req["sic_url"] or st.session_state.get("sic_url", DEFAULT_SIC_URL), key=f"sic_{req_id}")
-    sic_url = normalize_url(sic_input)
+    mid = [
+        ["하역 장소", req["unload_place"]],
+        ["하역 방법(인원/장비)", req["unload_method"]],
+        ["적재 장소", req["stack_place"]],
+        ["적재 방법(인원/장비)", req["stack_method"]],
+        ["적재 높이/단", req["stack_height"]],
+    ]
+    tm = Table(mid, colWidths=[40*mm, 140*mm])
+    tm.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(0,-1),colors.whitesmoke),
+        ("BOX",(0,0),(-1,-1),0.8,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.5,colors.lightgrey),
+        ("FONT",(0,0),(-1,-1),"Helvetica",9),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("LEFTPADDING",(0,0),(-1,-1),6),
+        ("RIGHTPADDING",(0,0),(-1,-1),6),
+        ("TOPPADDING",(0,0),(-1,-1),6),
+        ("BOTTOMPADDING",(0,0),(-1,-1),6),
+    ]))
+    tm.wrapOn(c, 0, 0)
+    tm.drawOn(c, 15*mm, A4[1]-160*mm)
 
-    ok, warn = validate_url(sic_url)
-    if not ok:
-        st.warning(f"URL 형식 경고: {warn}")
-    if sic_url:
-        st.link_button("링크 열기(테스트)", sic_url)
-        st.image(make_qr_png_bytes(sic_url), caption=sic_url, width=220)
+    safety = json.loads(req["safety_json"])
+    srows = [["구분", "내용"]]
+    for k, v in safety.items():
+        srows.append([k, v])
+    ts = Table(srows, colWidths=[30*mm, 150*mm])
+    ts.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F1F5F9")),
+        ("BOX",(0,0),(-1,-1),0.8,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.5,colors.lightgrey),
+        ("FONT",(0,0),(-1,-1),"Helvetica",9),
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("LEFTPADDING",(0,0),(-1,-1),6),
+        ("RIGHTPADDING",(0,0),(-1,-1),6),
+        ("TOPPADDING",(0,0),(-1,-1),5),
+        ("BOTTOMPADDING",(0,0),(-1,-1),5),
+    ]))
+    ts.wrapOn(c, 0, 0)
+    ts.drawOn(c, 15*mm, 45*mm)
 
-    st.markdown("### 🖋 전자서명(옵션)")
-    st.caption("서명이 필요하면 아래 캔버스에 서명 후 저장하세요. (없어도 승인 가능)")
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 255, 255, 0)",
-        stroke_width=3,
-        stroke_color="#111827",
-        background_color="#FFFFFF",
-        height=140,
-        width=520,
-        drawing_mode="freedraw",
-        key=f"sign_canvas_{req_id}",
-    )
+    c.setStrokeColor(colors.grey)
+    c.rect(15*mm, 20*mm, A4[0]-30*mm, 18*mm, stroke=1, fill=0)
+    c.setFont("Helvetica", 9)
+    c.drawString(17*mm, 32*mm, "결재(서명)")
+    c.drawRightString(A4[0]-17*mm, 24*mm, f"상태: {req['status']}  / 승인자: {req.get('approver_name') or '-'}")
+    c.showPage()
+    c.save()
 
-    st.markdown("### 🟥 도장 이미지(옵션)")
-    stamp_file = st.file_uploader("도장 이미지 업로드(PNG/JPG, 선택)", type=["png","jpg","jpeg"], key=f"stamp_{req_id}")
+def pdf_checkcard(req: Dict[str, Any], check: Dict[str, Any], out_path: str):
+    c = canvas.Canvas(out_path, pagesize=A4)
+    _draw_header(c, "자재 상/하차 점검카드", f"요청ID: {req['id']}  /  생성: {now()}")
 
-    colA, colB = st.columns([1, 1])
+    c.setFont("Helvetica", 10)
+    y = A4[1]-40*mm
+    c.drawString(15*mm, y, "0. 필수 참석자: 협력회사 담당자, 장비운전원, 차량운전원, 유도원, 안전보조원/감시단"); y -= 8*mm
+    c.drawString(15*mm, y, f"1. 협력회사: {req['company_name']}"); y -= 7*mm
+    c.drawString(15*mm, y, f"2. 화물/자재 종류: {req['item_name']}"); y -= 10*mm
 
-    if colA.button("승인(APPROVED) + PACKET 생성", type="primary"):
-        ensure_dirs()
+    items = [
+        ("3. 화물 당 2개소 이상 결속 여부 확인", check.get("tie_2plus","양호")),
+        ("4. 고정용 로프 및 밴딩 상태 점검 여부", check.get("rope_banding","")),
+        ("5. 화물 높이 4M 이하 적재, 낙하위험 발생여부", check.get("height_under_4m","")),
+        ("6. 적재함 폭 초과 상차 금지, 적재함 닫힘 여부", check.get("bed_width_close","")),
+        ("7. 자재차량 고임목 설치 여부", check.get("wheel_chock","")),
+        ("8. 적재하중 이내 적재 여부", check.get("within_load","")),
+        ("9. 화물 무게중심 확인 (한쪽으로 쏠림 여부)", check.get("center_of_mass","")),
+        ("10. 자재 하역구간 구획 및 통제 여부", check.get("zone_control","")),
+    ]
+    table_data = [["점검 항목", "확인/비고"]]
+    for a,b in items:
+        table_data.append([a,b])
 
-        sign_path = None
-        stamp_path = None
+    t = Table(table_data, colWidths=[120*mm, 60*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#EAF2FF")),
+        ("BOX",(0,0),(-1,-1),0.8,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.5,colors.lightgrey),
+        ("FONT",(0,0),(-1,-1),"Helvetica",9),
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("LEFTPADDING",(0,0),(-1,-1),6),
+        ("RIGHTPADDING",(0,0),(-1,-1),6),
+        ("TOPPADDING",(0,0),(-1,-1),6),
+        ("BOTTOMPADDING",(0,0),(-1,-1),6),
+    ]))
+    t.wrapOn(c, 0, 0)
+    t.drawOn(c, 15*mm, 45*mm)
 
-        if stamp_file is not None:
-            raw = stamp_file.read()
-            if raw:
-                p = BASE / "output" / "sign" / f"{req_id}_stamp.png"
-                save_bytes(p, raw)
-                stamp_path = str(p)
+    c.setFont("Helvetica", 9)
+    c.drawString(15*mm, 30*mm, "서명(운전원/유도원/안전): _____________________________   담당자: _____________________________")
+    c.showPage(); c.save()
 
-        if canvas_result is not None and canvas_result.image_data is not None:
-            try:
-                img = Image.fromarray(canvas_result.image_data.astype("uint8"), mode="RGBA")
-                bbox = img.getbbox()
-                if bbox:
-                    p = BASE / "output" / "sign" / f"{req_id}_sign.png"
-                    out = io.BytesIO()
-                    img.save(out, format="PNG")
-                    save_bytes(p, out.getvalue())
-                    sign_path = str(p)
-            except Exception:
-                sign_path = None
+def pdf_permit(req: Dict[str, Any], visitor_training_url: str, permit_public_url: str, out_path: str):
+    c = canvas.Canvas(out_path, pagesize=A4)
+    _draw_header(c, "자재 차량 진출입 허가증", f"요청ID: {req['id']}  /  생성: {now()}")
 
-        # ✅ 승인 시 sic_url 정규화 저장
-        db_update_request(req_id, {
-            "status": "APPROVED",
-            "approved_by": st.session_state["user_name"],
-            "approved_at": now_ts(),
-            "admin_sign_path": sign_path,
-            "stamp_path": stamp_path,
-            "sic_url": sic_url or normalize_url(DEFAULT_SIC_URL)
-        })
-        db_log(req_id, "APPROVE", st.session_state["user_name"], st.session_state["user_role"], "승인 처리")
+    # QR: 방문자 교육 링크(요청하신 링크)
+    qr = qrcode.QRCode(version=4, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
+    qr.add_data(visitor_training_url.strip() or "https://example.com")
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
 
-        req2 = db_get_request(req_id)
-        sic2 = req2["sic_url"] or normalize_url(DEFAULT_SIC_URL)
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    from reportlab.lib.utils import ImageReader
+    c.drawImage(ImageReader(bio), 15*mm, A4[1]-95*mm, width=35*mm, height=35*mm, mask='auto')
 
-        approval_b = pdf_approval(req2)
-        permit_b = pdf_permit_with_qr(req2, sic2)
-        packet_b = pdf_packet_light(req2, sic2)
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(55*mm, A4[1]-55*mm, f"입고 회사명: {req['company_name']}")
+    c.setFont("Helvetica", 11)
+    c.drawString(55*mm, A4[1]-65*mm, f"사용 GATE: {req['gate']}   /  시간: {req['time_from']}~{req['time_to']}")
+    c.drawString(55*mm, A4[1]-75*mm, f"차량: {req['vehicle_spec']} ({req['vehicle_count']}대)")
+    c.drawString(55*mm, A4[1]-85*mm, "필수 준수사항: 속도준수, 유도원 통제, 고임목, 결속상태 확인 등")
 
-        approval_p = BASE / "output" / "pdf" / f"{req_id}_approval.pdf"
-        permit_p = BASE / "output" / "pdf" / f"{req_id}_permit.pdf"
-        packet_p = BASE / "output" / "packet" / f"{req_id}_PACKET_LIGHT.pdf"
+    c.setFont("Helvetica", 9)
+    c.setFillColor(colors.HexColor("#334155"))
+    c.drawString(15*mm, A4[1]-105*mm, f"방문자교육 URL(QR): {visitor_training_url}")
+    c.drawString(15*mm, A4[1]-112*mm, f"허가증(웹열람): {permit_public_url}")
 
-        save_bytes(approval_p, approval_b)
-        save_bytes(permit_p, permit_b)
-        save_bytes(packet_p, packet_b)
+    c.setStrokeColor(colors.grey)
+    c.rect(15*mm, 25*mm, A4[0]-30*mm, 25*mm, stroke=1, fill=0)
+    c.setFont("Helvetica", 10)
+    c.setFillColor(colors.black)
+    c.drawString(17*mm, 40*mm, "운전원 확인(서명): _____________________")
+    c.drawString(110*mm, 40*mm, "담당자 확인(서명): _____________________")
 
-        outputs = {"approval_pdf": str(approval_p), "permit_pdf": str(permit_p), "packet_light": str(packet_p)}
-        db_update_request(req_id, {"outputs_json": json.dumps(outputs, ensure_ascii=False)})
+    c.showPage(); c.save()
 
-        st.success("승인 완료! PACKET_LIGHT 생성됨(단톡 업로드 권장)")
-        st.code(f"PACKET_LIGHT(로컬): {packet_p}")
-        if SHARE_UNC:
-            st.code(f"PACKET_LIGHT(UNC): {get_unc_path(str(packet_p))}")
 
-        st.download_button("PACKET_LIGHT 다운로드", data=packet_b, file_name=packet_p.name, mime="application/pdf")
+# =========================
+# 5) File Server (Flask) — token link
+# =========================
+flask_app = Flask(__name__)
+flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
 
-        msg = (
-            f"[자재 {('반입' if req2['io_type']=='IN' else '반출')} 승인]\n"
-            f"- REQ: {req_id}\n"
-            f"- 협력사: {req2['partner_company']}\n"
-            f"- 자재: {req2['material_type']}\n"
-            f"- 차량: {req2['vehicle_no']} / {req2['driver_phone']}\n"
-            f"- GATE: {req2['gate']}\n"
-            f"- 일시: {req2['work_date']} {req2['work_time']}\n"
-            f"- 결재: {req2['approved_by']} ({req2['approved_at']})\n"
-            f"※ PACKET_LIGHT(PDF) 업로드"
-        )
-        if SHARE_UNC:
-            msg += f"\n- 파일(UNC): {get_unc_path(str(packet_p))}"
-        st.text_area("📌 단톡 공유 문구(복사)", value=msg, height=180)
+@flask_app.get("/health")
+def health():
+    return {"ok": True, "ts": now()}
 
-    if colB.button("반려(REJECTED)"):
-        db_update_request(req_id, {"status": "REJECTED"})
-        db_log(req_id, "REJECT", st.session_state["user_name"], st.session_state["user_role"], "반려 처리")
-        st.warning("반려 처리했습니다.")
-        st.rerun()
+@flask_app.get("/f/<token>")
+def fetch_file(token: str):
+    row = file_by_token(token)
+    if not row:
+        abort(404)
+    path = row["path"]
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=False)
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
-def page_gate():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h2'>5) 게이트 확인</div>", unsafe_allow_html=True)
-    st.caption("REQ ID로 승인/실행 상태를 확인합니다. (경비용)")
-
-    req_id = st.text_input("REQ ID", placeholder="예) REQ_20260211_123456_IN")
-    if st.button("조회", type="primary"):
-        row = db_get_request(req_id.strip())
-        if not row:
-            st.error("해당 REQ ID가 없습니다.")
-        else:
-            st.success(f"상태: {row['status']}")
-            st.write(f"- 협력사: {row['partner_company']} / 자재: {row['material_type']}")
-            st.write(f"- 차량: {row['vehicle_no']} / {row['driver_phone']}")
-            st.write(f"- GATE: {row['gate']} / 일시: {row['work_date']} {row['work_time']}")
-            if row["status"] not in ("APPROVED", "EXECUTED"):
-                st.warning("승인(또는 실행) 상태가 아닙니다. 게이트 통과 전 승인 필요.")
-            try:
-                out = json.loads(row["outputs_json"] or "{}")
-            except Exception:
-                out = {}
-            packet = out.get("packet_light") or out.get("packet_full")
-            if packet and Path(packet).exists():
-                st.code(f"PACKET: {packet}")
-                if SHARE_UNC:
-                    st.code(f"PACKET(UNC): {get_unc_path(packet)}")
-                st.download_button("PACKET 다운로드", data=Path(packet).read_bytes(), file_name=Path(packet).name, mime="application/pdf")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-def page_execute():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h2'>6) 실행 등록 (사진 + 점검카드)</div>", unsafe_allow_html=True)
-    st.caption("APPROVED 선택 → 점검 → 필수사진 3종 + (옵션추가사진) 업로드 → EXECUTED + PACKET_FULL 생성")
-
-    approved = db_list_requests(status="APPROVED", limit=300)
-    executed = db_list_requests(status="EXECUTED", limit=80)
-
-    choices = []
-    for r in approved:
-        choices.append(f"{r['req_id']} | {r['partner_company']} | {r['material_type']} | {r['work_date']} {r['work_time']} | {r['gate']} | APPROVED")
-    for r in executed:
-        choices.append(f"{r['req_id']} | {r['partner_company']} | {r['material_type']} | {r['work_date']} {r['work_time']} | {r['gate']} | EXECUTED")
-
-    if not choices:
-        st.info("실행 대상(APPROVED/EXECUTED)이 없습니다.")
-        st.markdown("</div>", unsafe_allow_html=True)
+def start_file_server_once():
+    # Streamlit rerun 방지
+    if getattr(start_file_server_once, "_started", False):
         return
-
-    sel = st.selectbox("대상 선택", choices)
-    req_id = sel.split(" | ")[0]
-    req = db_get_request(req_id)
-
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-    st.write(f"**REQ:** {req_id} | 상태: **{req['status']}**")
-    st.write(f"- 협력사: {req['partner_company']} / 자재: {req['material_type']}")
-    st.write(f"- 차량: {req['vehicle_no']} / {req['driver_phone']}")
-    st.write(f"- GATE: {req['gate']} / 일시: {req['work_date']} {req['work_time']}")
-    st.write(f"- 위험도: {req['risk_level']}")
-
-    allowed_photo = can_upload_photos()
-    if not allowed_photo:
-        st.warning("현재 역할은 사진 업로드 권한이 없습니다. (관리자 설정에서 역할 허용 필요)")
-
-    st.markdown("### ✅ 점검카드")
-    attendees = st.multiselect(
-        "0. 필수 참석자",
-        ["협력회사 담당자", "장비운전원", "차량운전원", "유도원", "안전보조원/감시단"],
-        default=["협력회사 담당자", "차량운전원", "유도원"]
+    start_file_server_once._started = True  # type: ignore
+    th = threading.Thread(
+        target=lambda: flask_app.run(host=FILE_SERVER_HOST, port=FILE_SERVER_PORT, debug=False, use_reloader=False),
+        daemon=True
     )
+    th.start()
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        check_3 = st.selectbox("3. 화물 당 2개소 이상 결속 여부", ["양호", "미흡", "해당없음"])
-        check_4 = st.selectbox("4. 고정용 로프 및 밴딩 상태 점검", ["양호", "미흡", "해당없음"])
-        check_5 = st.selectbox("5. 화물 높이 4M 이하/낙하위험", ["양호", "미흡", "해당없음"])
-        check_6 = st.selectbox("6. 폭 초과 상차 금지/적재함 닫힘", ["양호", "미흡", "해당없음"])
-    with col2:
-        check_7 = st.selectbox("7. 자재차량 고임목 설치", ["양호", "미흡", "해당없음"])
-        check_8 = st.selectbox("8. 적재하중 이내 적재", ["양호", "미흡", "해당없음"])
-        check_9 = st.selectbox("9. 무게중심(쏠림 여부)", ["양호", "미흡", "해당없음"])
-        check_10 = st.selectbox("10. 하역구간 구획/통제", ["양호", "미흡", "해당없음"])
+start_file_server_once()
 
-    st.markdown("### 📷 실행 사진")
-    st.caption("필수 3종(상차 전/후, 결속 근접)은 반드시 업로드해야 실행완료 등록이 됩니다. 추가 사진은 선택입니다.")
 
-    labels_required = ["상차 전", "상차 후", "결속/밴딩 근접"]
-    uploaded_required = []
-    for i, lab in enumerate(labels_required):
-        f = st.file_uploader(
-            f"[필수 {i+1}] {lab}",
-            type=["jpg", "jpeg", "png"],
-            key=f"photo_req_{req_id}_{i}",
-            disabled=not allowed_photo
-        )
-        uploaded_required.append(f)
+# =========================
+# 6) UI (Streamlit)
+# =========================
+st.set_page_config(page_title=f"{APP_NAME}", page_icon="✅", layout="wide")
 
-    st.markdown("#### ➕ 추가 사진(옵션)")
-    extra_files = st.file_uploader(
-        "추가 사진을 여러 장 선택 업로드하세요(선택)",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key=f"photo_extra_{req_id}",
-        disabled=not allowed_photo
-    )
+# Light UI CSS (간단하지만 "개발 완료 느낌")
+st.markdown("""
+<style>
+:root{
+  --bg:#F6F8FC; --card:#fff; --text:#0F172A; --muted:#64748B; --line:#E5E7EB; --pri:#0B5FFF;
+  --shadow:0 10px 30px rgba(2,8,23,.08); --r:18px;
+}
+.stApp{ background:var(--bg); }
+.block-container{ max-width:1200px; padding-top:1.0rem; padding-bottom:3.5rem;}
+.card{ background:var(--card); border:1px solid var(--line); border-radius:var(--r); box-shadow:var(--shadow); padding:16px 18px;}
+.kpi{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; box-shadow:var(--shadow); }
+.kpi .t{ font-size:12px; color:var(--muted); margin-bottom:4px;}
+.kpi .v{ font-size:22px; font-weight:900; color:var(--text);}
+@media (max-width:980px){ .block-container{padding-left:12px;padding-right:12px;} }
+</style>
+""", unsafe_allow_html=True)
 
-    colA, colB = st.columns([1, 1])
+# session
+st.session_state.setdefault("auth_ok", False)
+st.session_state.setdefault("is_admin", False)
+st.session_state.setdefault("user_name", "")
+st.session_state.setdefault("user_role", "공무")
+st.session_state.setdefault("site_name", "현장명(수정)")
+st.session_state.setdefault("selected_req_id", None)
 
-    if colA.button("실행 저장 + PACKET_FULL 생성", type="primary"):
-        if req["status"] not in ("APPROVED", "EXECUTED"):
-            st.error("승인(APPROVED) 상태에서만 실행 등록이 가능합니다.")
-            st.stop()
+# KPI
+def kpis():
+    rows = req_list()
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_cnt = sum(1 for r in rows if r["created_at"][:10] == today)
+    approved = sum(1 for r in rows if r["status"] == "APPROVED")
+    pending  = sum(1 for r in rows if r["status"] == "REQUESTED")
+    done     = sum(1 for r in rows if r["status"] == "DONE")
+    rejecting= sum(1 for r in rows if r["status"] == "REJECTED")
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.markdown(f"<div class='kpi'><div class='t'>오늘 요청</div><div class='v'>{today_cnt}</div></div>", unsafe_allow_html=True)
+    c2.markdown(f"<div class='kpi'><div class='t'>대기</div><div class='v'>{pending}</div></div>", unsafe_allow_html=True)
+    c3.markdown(f"<div class='kpi'><div class='t'>승인</div><div class='v'>{approved}</div></div>", unsafe_allow_html=True)
+    c4.markdown(f"<div class='kpi'><div class='t'>반려</div><div class='v'>{rejecting}</div></div>", unsafe_allow_html=True)
+    c5.markdown(f"<div class='kpi'><div class='t'>완료</div><div class='v'>{done}</div></div>", unsafe_allow_html=True)
 
-        if not allowed_photo:
-            st.error("사진 업로드 권한이 없어 실행 완료 처리할 수 없습니다.")
-            st.stop()
+# Sidebar Login
+with st.sidebar:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("🔐 로그인")
 
-        if any(u is None for u in uploaded_required):
-            st.error("필수 사진 3종(상차 전/후, 결속 근접)을 모두 업로드해주세요.")
-            st.stop()
+    admin_mode = st.toggle("관리자 모드로 로그인", value=False, help="이 토글을 켜면 Admin PIN 입력칸이 나타납니다.")
+    site_pin  = st.text_input("현장 PIN", type="password", placeholder="4자리")
+    admin_pin = ""
+    if admin_mode:
+        admin_pin = st.text_input("Admin PIN", type="password", placeholder="관리자 4자리")
 
-        ensure_dirs()
-        photo_dir = BASE / "output" / "photos" / req_id
-        photo_dir.mkdir(parents=True, exist_ok=True)
+    st.divider()
+    name = st.text_input("이름/직책", placeholder="예) 공무팀장 홍길동")
+    role = st.selectbox("역할", ["공무","안전","경비","협력사","기타"], index=0)
+    site_name = st.text_input("현장명", value=st.session_state["site_name"])
+    visitor_url = st.text_input("방문자교육 URL(QR)", value=meta_get("visitor_training_url") or DEFAULT_VISITOR_TRAINING_URL)
 
-        photo_records = []
+    c1,c2 = st.columns(2)
+    with c1:
+        if st.button("로그인", use_container_width=True):
+            ok_site = (site_pin.strip() == meta_get("site_pin"))
+            ok_admin= (admin_mode and admin_pin.strip() == meta_get("admin_pin"))
+            if not ok_site:
+                st.error("현장 PIN이 틀립니다.")
+            else:
+                st.session_state["auth_ok"] = True
+                st.session_state["is_admin"] = bool(ok_admin)
+                st.session_state["user_name"] = name.strip() or "사용자"
+                st.session_state["user_role"] = role
+                st.session_state["site_name"] = site_name.strip() or "현장명"
+                meta_set("visitor_training_url", visitor_url.strip())
+                st.success("로그인 완료")
+                st.rerun()
+    with c2:
+        if st.button("로그아웃", use_container_width=True):
+            st.session_state["auth_ok"] = False
+            st.session_state["is_admin"] = False
+            st.session_state["selected_req_id"] = None
+            st.success("로그아웃 완료")
+            st.rerun()
 
-        for i, u in enumerate(uploaded_required):
-            raw = u.read()
-            jpg = bytes_to_jpg_bytes(raw)
-            p = photo_dir / f"{req_id}_photo_REQ_{i+1}.jpg"
-            save_bytes(p, jpg)
-            photo_records.append({"label": labels_required[i], "path": str(p), "required": True})
+    st.caption(f"파일 링크 서버: {PUBLIC_BASE_URL}  (포트 {FILE_SERVER_PORT})")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if extra_files:
-            for j, uf in enumerate(extra_files, 1):
-                raw = uf.read()
-                jpg = bytes_to_jpg_bytes(raw)
-                p = photo_dir / f"{req_id}_photo_OPT_{j}.jpg"
-                save_bytes(p, jpg)
-                photo_records.append({"label": f"추가사진 {j}", "path": str(p), "required": False})
+if not st.session_state["auth_ok"]:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.title(f"{APP_NAME}")
+    st.caption(f"{APP_VER} · 단일 파일 통합본")
+    st.info("좌측에서 현장 PIN으로 로그인하면 시작합니다. 관리자 PIN은 '관리자 모드' 토글을 켜면 입력칸이 보입니다.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
 
-        checklist = {
-            "attendees": ", ".join(attendees),
-            "partner_company": req["partner_company"],
-            "cargo_type": req["material_type"],
-            "check_3": check_3,
-            "check_4": check_4,
-            "check_5": check_5,
-            "check_6": check_6,
-            "check_7": check_7,
-            "check_8": check_8,
-            "check_9": check_9,
-            "check_10": check_10,
+# Header
+st.markdown(f"""
+<div class='card'>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <div>
+      <div style="font-size:22px;font-weight:900;">{st.session_state['site_name']} · 자재 반출입 승인</div>
+      <div style="color:#64748B;margin-top:4px;">
+        로그인: {st.session_state['user_name']} · {st.session_state['user_role']} {"(ADMIN)" if st.session_state['is_admin'] else ""}
+      </div>
+    </div>
+    <div style="color:#64748B;">
+      산출물 저장: <b>{PATHS['BASE']}</b><br/>
+      파일링크: <b>{PUBLIC_BASE_URL}/f/&lt;token&gt;</b>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+kpis()
+st.divider()
+
+# Navigation
+tabs = st.tabs(["① 신청", "② 승인", "③ 실행", "④ 대장/열람", "⑤ 관리자"])
+
+# ① 신청
+with tabs[0]:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("① 반입/반출 신청")
+    cA,cB = st.columns(2)
+
+    with cA:
+        kind = st.radio("구분", ["반입(IN)","반출(OUT)"], horizontal=True)
+        company = st.text_input("회사명(협력사)", placeholder="예) 덕일플러스건설(주)")
+        item_name = st.text_input("취급 자재/도구명", placeholder="예) 덕트/철근/소부재")
+        item_type = st.text_input("자재 종류", placeholder="예) 덕트자재")
+        work_type = st.text_input("공종", placeholder="예) MEP / 철근콘크리트")
+        leader = st.text_input("작업 지휘자", placeholder="예) OOO")
+        date = st.date_input("일자").strftime("%Y-%m-%d")
+        time_from = st.text_input("시간(시작)", value="07:00")
+        time_to   = st.text_input("시간(종료)", value="09:00")
+        gate = st.selectbox("사용 GATE", ["1GATE","2GATE","3GATE","4GATE","기타"], index=2)
+
+    with cB:
+        vehicle_spec = st.text_input("차량 규격", value="11TON")
+        vehicle_count = st.number_input("대수", min_value=1, max_value=50, value=1, step=1)
+
+        st.caption("PKG(1~3개만 적어도 운영 가능)")
+        pkg_n = st.number_input("PKG 행 수", min_value=1, max_value=8, value=1, step=1)
+        pkg_rows = []
+        for i in range(int(pkg_n)):
+            with st.expander(f"PKG #{i+1}", expanded=(i==0)):
+                pkg_rows.append({
+                    "name": st.text_input(f"항목명 #{i+1}", key=f"pkg_name_{i}"),
+                    "size": st.text_input(f"크기(WxDxH) #{i+1}", key=f"pkg_size_{i}"),
+                    "total_weight": st.text_input(f"총 무게 #{i+1}", key=f"pkg_tw_{i}"),
+                    "pkg_weight": st.text_input(f"PKG당 무게/개수 #{i+1}", key=f"pkg_pw_{i}"),
+                    "pkg_count": st.text_input(f"총 PKG 수 #{i+1}", key=f"pkg_pc_{i}"),
+                    "binding": st.text_input(f"결속 방법 #{i+1}", key=f"pkg_bind_{i}"),
+                    "stack": st.text_input(f"적재 높이/단 #{i+1}", key=f"pkg_stack_{i}"),
+                })
+
+    st.markdown("##### 하역/적재")
+    d1,d2 = st.columns(2)
+    with d1:
+        unload_place = st.text_input("하역 장소", placeholder="예) 1F GATE#3")
+        unload_method= st.text_area("하역 방법(인원/장비)", height=70, placeholder="예) 지게차 4.5t 1대, 유도원 2명")
+    with d2:
+        stack_place = st.text_input("적재 장소", placeholder="예) 1F GATE#3 복공판")
+        stack_method= st.text_area("적재 방법(인원/장비)", height=70, placeholder="예) 지게차 하역 후 이동")
+        stack_height= st.text_input("적재 높이/단", placeholder="예) 1단")
+
+    st.markdown("##### 안전대책(최소 필수)")
+    safety = {
+        "구획 방법": st.text_input("구획 방법", value="라바콘/바리케이드/유도원 통제"),
+        "전도": st.text_input("전도", value="결속 및 균형 유지"),
+        "협착": st.text_input("협착", value="신호수 배치/작업반경 통제"),
+        "붕괴": st.text_input("붕괴", value="과다 적재 금지"),
+        "추락": st.text_input("추락", value="상부 작업 시 추락방지"),
+        "낙하": st.text_input("낙하", value="결속 상태 확인/낙하물 방지"),
+    }
+
+    if st.button("요청 등록", type="primary", use_container_width=True):
+        req_id = datetime.now().strftime("%y%m%d") + "-" + uuid.uuid4().hex[:8]
+        data = {
+            "id": req_id,
+            "created_at": now(),
+            "site_name": st.session_state["site_name"],
+            "kind": "inbound" if kind.startswith("반입") else "outbound",
+            "company_name": company.strip(),
+            "item_name": item_name.strip(),
+            "item_type": item_type.strip(),
+            "work_type": work_type.strip(),
+            "leader": leader.strip(),
+            "date": date,
+            "time_from": time_from.strip(),
+            "time_to": time_to.strip(),
+            "gate": gate,
+            "vehicle_spec": vehicle_spec.strip(),
+            "vehicle_count": int(vehicle_count),
+            "pkg_json": json.dumps(pkg_rows, ensure_ascii=False),
+            "unload_place": unload_place.strip(),
+            "unload_method": unload_method.strip(),
+            "stack_place": stack_place.strip(),
+            "stack_method": stack_method.strip(),
+            "stack_height": stack_height.strip(),
+            "safety_json": json.dumps(safety, ensure_ascii=False),
+            "status": "REQUESTED",
+            "requester_name": st.session_state["user_name"],
+            "requester_role": st.session_state["user_role"],
+            "approver_name": None,
+            "approver_role": None,
+            "approved_at": None,
+            "reject_reason": None,
+            "executed_at": None,
         }
-
-        db_update_request(req_id, {
-            "status": "EXECUTED",
-            "exec_by": st.session_state["user_name"],
-            "exec_at": now_ts(),
-            "photo_dir": str(photo_dir),
-            "checklist_json": json.dumps(checklist, ensure_ascii=False),
-            "photos_json": json.dumps(photo_records, ensure_ascii=False),
-        })
-        db_log(req_id, "EXECUTE", st.session_state["user_name"], st.session_state["user_role"], "실행 등록")
-
-        req2 = db_get_request(req_id)
-        sic_url = normalize_url(req2["sic_url"] or st.session_state.get("sic_url", DEFAULT_SIC_URL)) or normalize_url(DEFAULT_SIC_URL)
-
-        try:
-            out0 = json.loads(req2["outputs_json"] or "{}")
-        except Exception:
-            out0 = {}
-
-        check_b = pdf_checkcard(req2, checklist)
-        exec_b = pdf_exec_photos(req2, photo_records)
-        packet_b = pdf_packet_full(req2, sic_url, checklist, photo_records)
-
-        check_p = BASE / "output" / "check" / f"{req_id}_checkcard.pdf"
-        exec_p = BASE / "output" / "pdf" / f"{req_id}_exec_photos.pdf"
-        packet_p = BASE / "output" / "packet" / f"{req_id}_PACKET_FULL.pdf"
-
-        save_bytes(check_p, check_b)
-        save_bytes(exec_p, exec_b)
-        save_bytes(packet_p, packet_b)
-
-        out0.update({
-            "checkcard_pdf": str(check_p),
-            "exec_photos_pdf": str(exec_p),
-            "packet_full": str(packet_p),
-        })
-        db_update_request(req_id, {"outputs_json": json.dumps(out0, ensure_ascii=False)})
-
-        files = []
-        for k in ("approval_pdf", "permit_pdf", "packet_light", "checkcard_pdf", "exec_photos_pdf", "packet_full"):
-            p = out0.get(k)
-            if p and Path(p).exists():
-                files.append(Path(p))
-        zip_p = BASE / "output" / "zip" / f"{req_id}_sharepack.zip"
-        make_zip(zip_p, files)
-        out0["zip_pack"] = str(zip_p)
-        db_update_request(req_id, {"outputs_json": json.dumps(out0, ensure_ascii=False)})
-
-        st.success("실행 완료! PACKET_FULL 생성됨(단톡 업로드 권장)")
-        st.code(f"PACKET_FULL(로컬): {packet_p}")
-        if SHARE_UNC:
-            st.code(f"PACKET_FULL(UNC): {get_unc_path(str(packet_p))}")
-
-        st.download_button("PACKET_FULL 다운로드", data=packet_b, file_name=packet_p.name, mime="application/pdf")
-
-        msg = (
-            f"[자재 {('반입' if req2['io_type']=='IN' else '반출')} 실행완료]\n"
-            f"- REQ: {req_id}\n"
-            f"- 협력사: {req2['partner_company']}\n"
-            f"- 자재: {req2['material_type']}\n"
-            f"- 차량: {req2['vehicle_no']} / {req2['driver_phone']}\n"
-            f"- GATE: {req2['gate']}\n"
-            f"- 일시: {req2['work_date']} {req2['work_time']}\n"
-            f"- 결재: {req2['approved_by']} ({req2['approved_at']})\n"
-            f"- 실행: {req2['exec_by']} ({req2['exec_at']})\n"
-            f"※ PACKET_FULL(PDF) 업로드"
-        )
-        if SHARE_UNC:
-            msg += f"\n- 파일(UNC): {get_unc_path(str(packet_p))}"
-
-        st.text_area("📌 단톡 공유 문구(복사)", value=msg, height=200)
-
-    if colB.button("산출물 경로 보기"):
-        req2 = db_get_request(req_id)
-        try:
-            out = json.loads(req2["outputs_json"] or "{}")
-        except Exception:
-            out = {}
-        st.json(out)
-
+        req_insert(data)
+        st.session_state["selected_req_id"] = req_id
+        st.success(f"등록 완료: {req_id} (승인 탭으로 이동해 승인 처리하세요)")
     st.markdown("</div>", unsafe_allow_html=True)
 
-def page_registry():
+# ② 승인
+with tabs[1]:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h2'>7) 대장</div>", unsafe_allow_html=True)
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        date_filter = st.date_input("일자", value=date.today()).strftime("%Y-%m-%d")
-    with col2:
-        status_filter = st.selectbox("상태", ["(전체)", "PENDING", "APPROVED", "EXECUTED", "REJECTED"])
-
-    rows = db_list_requests(status=None if status_filter == "(전체)" else status_filter, date_filter=date_filter, limit=300)
+    st.subheader("② 승인/반려")
+    rows = req_list()
     if not rows:
-        st.info("해당 조건의 데이터가 없습니다.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+        st.info("요청이 없습니다.")
+    else:
+        # pick
+        labels = [f"{r['id']} | {r['status']} | {r['company_name']} | {r['item_name']} | {r['date']} {r['time_from']}~{r['time_to']} | {r['gate']}" for r in rows]
+        sel = st.selectbox("요청 선택", labels, index=0)
+        req_id = sel.split("|")[0].strip()
+        st.session_state["selected_req_id"] = req_id
+        req = req_get(req_id)
+        st.json({k:req[k] for k in ["id","status","kind","company_name","item_name","item_type","work_type","leader","date","time_from","time_to","gate","vehicle_spec","vehicle_count","requester_name","requester_role","approver_name","approved_at","reject_reason"]}, expanded=False)
 
-    ids = [r["req_id"] for r in rows]
-    sel = st.selectbox("REQ 선택", ids)
-    req = db_get_request(sel)
-
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-    st.write(f"**{req['req_id']}** | 상태: **{req['status']}**")
-    st.write(f"- 협력사: {req['partner_company']} / 자재: {req['material_type']}")
-    st.write(f"- 차량: {req['vehicle_no']} / {req['driver_phone']} / GATE: {req['gate']}")
-    st.write(f"- 일시: {req['work_date']} {req['work_time']} / 위험도: {req['risk_level']}")
-    st.write(f"- 기안: {req['requester_name']}({req['requester_role']}) @ {req['created_at']}")
-    st.write(f"- 결재: {req['approved_by'] or '-'} @ {req['approved_at'] or '-'}")
-    st.write(f"- 실행: {req['exec_by'] or '-'} @ {req['exec_at'] or '-'}")
-
-    try:
-        out = json.loads(req["outputs_json"] or "{}")
-    except Exception:
-        out = {}
-
-    st.markdown("### 📄 산출물")
-    for label, key in [
-        ("PACKET_LIGHT", "packet_light"),
-        ("PACKET_FULL", "packet_full"),
-        ("승인서", "approval_pdf"),
-        ("허가증(QR)", "permit_pdf"),
-        ("점검카드", "checkcard_pdf"),
-        ("실행사진", "exec_photos_pdf"),
-        ("ZIP", "zip_pack"),
-    ]:
-        p = out.get(key)
-        if p and Path(p).exists():
-            colA, colB = st.columns([2, 1])
-            colA.code(f"{label}: {p}")
-            if SHARE_UNC:
-                colA.caption(f"UNC: {get_unc_path(p)}")
-            data = Path(p).read_bytes()
-            mime = "application/pdf" if p.lower().endswith(".pdf") else "application/zip"
-            colB.download_button("다운로드", data=data, file_name=Path(p).name, mime=mime, key=f"dl_{key}_{sel}")
-
-    st.markdown("### 🧾 로그")
-    logs = db_get_logs(sel, limit=50)
-    for lg in logs:
-        st.write(f"- [{lg['created_at']}] {lg['action']} / {lg['actor']}({lg['actor_role']}) — {lg['detail'] or ''}")
+        can_approve = st.session_state["is_admin"] or st.session_state["user_role"] in ["공무","안전"]
+        if not can_approve:
+            st.warning("승인 권한이 없습니다. (관리자 또는 공무/안전만 승인)")
+        else:
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("승인", type="primary", use_container_width=True, disabled=req["status"]!="REQUESTED"):
+                    req_update(req_id, {
+                        "status":"APPROVED",
+                        "approver_name": st.session_state["user_name"],
+                        "approver_role": st.session_state["user_role"],
+                        "approved_at": now(),
+                        "reject_reason": None
+                    })
+                    st.success("승인 완료")
+                    st.rerun()
+            with c2:
+                reason = st.text_input("반려 사유", placeholder="예) 차량번호/규격 확인 필요")
+                if st.button("반려", use_container_width=True, disabled=req["status"]!="REQUESTED"):
+                    req_update(req_id, {"status":"REJECTED", "reject_reason": reason})
+                    st.warning("반려 처리됨")
+                    st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+# ③ 실행
+with tabs[2]:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("③ 실행 등록 (필수 3장 + 추가 사진 옵션) + 산출물 생성")
 
-# =========================
-# 7) APP MAIN
-# =========================
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    inject_css()
-    db_init()
+    approved = req_list("APPROVED")
+    if not approved:
+        st.info("승인된 건이 없습니다.")
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        labels = [f"{r['id']} | {r['company_name']} | {r['item_name']} | {r['date']} {r['time_from']}~{r['time_to']} | {r['gate']}" for r in approved]
+        sel = st.selectbox("승인건 선택", labels, index=0)
+        req_id = sel.split("|")[0].strip()
+        st.session_state["selected_req_id"] = req_id
+        req = req_get(req_id)
 
-    require_login()
-    header_area()
-    sidebar_area()
+        st.caption("필수 3장은 충족해야 등록됩니다. 추가 사진은 무제한(옵션)으로 계속 가능.")
+        left,right = st.columns(2)
+        with left:
+            required_files = st.file_uploader("필수 사진 3장", type=["png","jpg","jpeg"], accept_multiple_files=True, key="req_ph")
+            optional_files = st.file_uploader("추가 사진(옵션)", type=["png","jpg","jpeg"], accept_multiple_files=True, key="opt_ph")
 
-    st.session_state.setdefault("page", "홈")
+        with right:
+            st.markdown("**자재 상/하차 점검카드**")
+            check = {
+                "tie_2plus": st.text_input("3. 2개소 이상 결속 여부", value="양호"),
+                "rope_banding": st.text_input("4. 로프/밴딩 상태", value=""),
+                "height_under_4m": st.text_input("5. 높이 4m 이하/낙하위험", value=""),
+                "bed_width_close": st.text_input("6. 적재함 폭/닫힘", value=""),
+                "wheel_chock": st.text_input("7. 고임목 설치", value=""),
+                "within_load": st.text_input("8. 적재하중 이내", value=""),
+                "center_of_mass": st.text_input("9. 무게중심(쏠림)", value=""),
+                "zone_control": st.text_input("10. 하역구간 통제", value=""),
+            }
 
-    pages = ["홈", "신청", "승인", "게이트", "실행", "대장"]
-    selected = st.radio("메뉴", pages, horizontal=True, index=pages.index(st.session_state["page"]) if st.session_state["page"] in pages else 0)
-    st.session_state["page"] = selected
+        if st.button("실행 등록 + 산출물 생성", type="primary", use_container_width=True):
+            if not required_files or len(required_files) < 3:
+                st.error("필수 사진은 최소 3장 필요합니다.")
+            else:
+                # save photos
+                req_saved = save_uploads(req_id, required_files, "required")
+                opt_saved = save_uploads(req_id, optional_files or [], "optional")
 
-    if selected == "홈":
-        page_home()
-    elif selected == "신청":
-        page_apply()
-    elif selected == "승인":
-        page_approve()
-    elif selected == "게이트":
-        page_gate()
-    elif selected == "실행":
-        page_execute()
-    elif selected == "대장":
-        page_registry()
+                # store categories: first 3 -> required1~3, rest if any -> optional
+                for i, path in enumerate(req_saved[:3]):
+                    photo_add(req_id, f"required{i+1}", path, st.session_state["user_name"])
+                # if more than 3 in required uploader, treat surplus as optional
+                for path in req_saved[3:]:
+                    photo_add(req_id, "optional", path, st.session_state["user_name"])
+                for path in opt_saved:
+                    photo_add(req_id, "optional", path, st.session_state["user_name"])
 
-if __name__ == "__main__":
-    main()
+                # checkcard save
+                checkcard_upsert(req_id, check)
+
+                # generate PDFs
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                prefix = safe_filename(f"{req['site_name']}_{req['id']}_{stamp}")
+
+                plan_path   = p(PATHS["PDF"],   f"{prefix}_계획서.pdf")
+                check_path  = p(PATHS["CHECK"], f"{prefix}_점검카드.pdf")
+                permit_path = p(PATHS["PERMIT"],f"{prefix}_허가증(QR).pdf")
+                zip_path    = p(PATHS["ZIP"],   f"{prefix}_BUNDLE.zip")
+
+                pdf_plan(req, plan_path)
+                pdf_checkcard(req, check, check_path)
+
+                # permit token URL for printing in permit PDF
+                permit_token = make_token(req_id, "permit")
+                permit_public = public_file_url(permit_token)
+                visitor_url = meta_get("visitor_training_url") or DEFAULT_VISITOR_TRAINING_URL
+                pdf_permit(req, visitor_url, permit_public, permit_path)
+
+                # register tokens for plan/check/permit
+                plan_token  = make_token(req_id, "plan")
+                check_token = make_token(req_id, "check")
+                file_token_upsert(plan_token, req_id, "plan", plan_path)
+                file_token_upsert(check_token, req_id, "check", check_path)
+                file_token_upsert(permit_token, req_id, "permit", permit_path)
+
+                # bundle zip
+                all_photos = [x["path"] for x in photo_list(req_id)]
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                    for fp in [plan_path, check_path, permit_path]:
+                        if os.path.exists(fp):
+                            z.write(fp, arcname=os.path.basename(fp))
+                    for fp in all_photos:
+                        if os.path.exists(fp):
+                            z.write(fp, arcname=p("photos", os.path.basename(fp)))
+                    z.writestr("request.json", json.dumps(req, ensure_ascii=False, indent=2))
+                    z.writestr("paths.txt", "\n".join([f"{k}={v}" for k,v in PATHS.items()]))
+
+                zip_token = make_token(req_id, "zip")
+                file_token_upsert(zip_token, req_id, "zip", zip_path)
+
+                # status done
+                req_update(req_id, {"status":"DONE", "executed_at": now()})
+
+                # show share message
+                msg = f"""[{req['site_name']}] 자재 {('반입' if req['kind']=='inbound' else '반출')} 실행완료
+- 요청ID: {req_id}
+- 회사: {req['company_name']}
+- 자재: {req['item_name']} ({req['item_type']})
+- 일시: {req['date']} {req['time_from']}~{req['time_to']}
+- GATE: {req['gate']}
+
+[PDF 바로보기]
+- 계획서: {public_file_url(plan_token)}
+- 점검카드: {public_file_url(check_token)}
+- 허가증(QR포함): {public_file_url(permit_token)}
+
+(공유용 ZIP) {public_file_url(zip_token)}
+"""
+                st.success("실행 등록 및 산출물 생성 완료")
+                st.text_area("카톡 단톡방 공유 문구(복사)", value=msg, height=220)
+
+                st.caption("※ 일반 카카오 단톡방은 서버가 자동 전송하기 어렵습니다(정책/보안). 위 문구+링크를 복사해 단톡방에 붙여넣는 방식이 가장 안정적입니다.")
+                st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ④ 대장/열람
+with tabs[3]:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("④ 대장 / PDF 열람")
+    rows = req_list()
+    if not rows:
+        st.info("대장이 비어 있습니다.")
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        q = st.text_input("검색(요청ID/회사/자재/게이트)", value="")
+        def match(r):
+            if not q.strip(): return True
+            s = (r["id"]+r["company_name"]+r["item_name"]+r["gate"]).lower()
+            return q.lower() in s
+        filt = [r for r in rows if match(r)]
+        labels = [f"{r['id']} | {r['status']} | {r['company_name']} | {r['item_name']} | {r['date']} | {r['gate']}" for r in filt] or ["(검색 결과 없음)"]
+        sel = st.selectbox("요청 선택", labels, index=0)
+        if sel.startswith("("):
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            req_id = sel.split("|")[0].strip()
+            st.session_state["selected_req_id"] = req_id
+            req = req_get(req_id)
+            st.json({k:req[k] for k in ["id","status","kind","company_name","item_name","item_type","date","time_from","time_to","gate","approver_name","approved_at","executed_at"]}, expanded=False)
+
+            # latest files by type
+            fs = files_for_request(req_id)
+            if not fs:
+                st.warning("산출물이 없습니다. (실행 탭에서 생성)")
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                by = {}
+                for f in fs:
+                    if f["file_type"] not in by:
+                        by[f["file_type"]] = f
+
+                c1,c2,c3 = st.columns(3)
+                if "plan" in by:
+                    with c1:
+                        st.markdown("**계획서**")
+                        st.write(public_file_url(by["plan"]["token"]))
+                        if st.button("계획서 보기", use_container_width=True):
+                            embed_pdf(by["plan"]["path"])
+                if "check" in by:
+                    with c2:
+                        st.markdown("**점검카드**")
+                        st.write(public_file_url(by["check"]["token"]))
+                        if st.button("점검카드 보기", use_container_width=True):
+                            embed_pdf(by["check"]["path"])
+                if "permit" in by:
+                    with c3:
+                        st.markdown("**허가증(QR)**")
+                        st.write(public_file_url(by["permit"]["token"]))
+                        if st.button("허가증 보기", use_container_width=True):
+                            embed_pdf(by["permit"]["path"])
+
+                # quick downloads
+                st.markdown("#### 다운로드")
+                for k in ["plan","check","permit","zip"]:
+                    if k in by and os.path.exists(by[k]["path"]):
+                        with open(by[k]["path"], "rb") as f:
+                            st.download_button(f"{k.upper()} 다운로드", f, file_name=os.path.basename(by[k]["path"]), use_container_width=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ⑤ 관리자
+with tabs[4]:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("⑤ 관리자")
+    if not st.session_state["is_admin"]:
+        st.warning("관리자 모드로 로그인해야 접근 가능합니다. (좌측 '관리자 모드로 로그인' 토글 ON)")
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("### PIN/링크 설정")
+        col1,col2 = st.columns(2)
+        with col1:
+            new_site = st.text_input("현장 PIN 변경", value=meta_get("site_pin"), type="password")
+            if st.button("현장 PIN 저장", use_container_width=True):
+                meta_set("site_pin", new_site.strip())
+                st.success("저장 완료")
+        with col2:
+            new_admin = st.text_input("Admin PIN 변경", value=meta_get("admin_pin"), type="password")
+            if st.button("Admin PIN 저장", use_container_width=True):
+                meta_set("admin_pin", new_admin.strip())
+                st.success("저장 완료")
+
+        new_visitor = st.text_input("방문자교육 URL(QR)", value=meta_get("visitor_training_url") or DEFAULT_VISITOR_TRAINING_URL)
+        if st.button("방문자교육 URL 저장", use_container_width=True):
+            meta_set("visitor_training_url", new_visitor.strip())
+            st.success("저장 완료")
+
+        st.divider()
+        st.markdown("### 저장 위치/운영 점검")
+        st.code("\n".join([f"{k}: {v}" for k,v in PATHS.items()]), language="text")
+        st.code(f"PUBLIC_BASE_URL: {PUBLIC_BASE_URL}\nFILE_SERVER: {FILE_SERVER_HOST}:{FILE_SERVER_PORT}\n/health: {PUBLIC_BASE_URL}/health", language="text")
+        st.caption("외부 접속이 안 되면: 공인IP/도메인, 포트(8801) 방화벽 오픈, 리버스프록시/HTTPS 여부를 확인해야 합니다.")
+
+    st.markdown("</div>", unsafe_allow_html=True)

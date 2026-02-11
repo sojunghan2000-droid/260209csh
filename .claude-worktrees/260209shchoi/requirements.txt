@@ -1,6 +1,6 @@
 streamlit>=1.30.0
-pandas
+flask
+werkzeug
 qrcode[pil]
 Pillow
 reportlab
-streamlit-drawable-canvas
