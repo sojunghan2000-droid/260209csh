@@ -1,9 +1,8 @@
 # ============================================================
-# Material In/Out Approval Tool (SITE) - app.py v2.6.0
-# - Role: 협력사 / 공사 / 안전 / 경비 (+ 관리자모드)
-# - Flow: 요청(협력사) -> 승인(안전->공사) -> 실행(사진+점검) -> 산출물(PDF/QR/ZIP) -> 공유문구(카톡 단톡 붙여넣기)
-# - Mobile/Web responsive UI (Tabs 기반)
-# - Single-file, SQLite 기반(로컬/내부망 서버 가능)
+# Material In/Out Approval Tool (SITE) - app.py v2.6.1
+# - FIX: 모바일 "직접 서명" (캔버스) + 옵션 이미지 업로드
+# - FIX: 모바일 "직접 촬영" (camera_input) + 추가사진(옵션) 업로드
+# - 기존 흐름/DB/산출물 구조 유지
 # ============================================================
 import os
 import io
@@ -29,20 +28,26 @@ try:
     import qrcode
 except Exception:
     QR_AVAILABLE = False
+# --- Optional signature canvas
+CANVAS_AVAILABLE = True
+try:
+    from streamlit_drawable_canvas import st_canvas
+    from PIL import Image
+except Exception:
+    CANVAS_AVAILABLE = False
 # -------------------------
 # Constants / Version
 # -------------------------
-APP_VERSION = "v2.6.0"
+APP_VERSION = "v2.6.1"
 APP_TITLE = "자재 반출입 승인 · 실행 · 산출물(통합)"
 DEFAULT_SITE_NAME = "현장명(수정)"
 DEFAULT_BASE_DIR = "MaterialToolShared"  # 한 폴더로 통합
 DEFAULT_SITE_PIN = "1234"   # 관리자에서 변경 권장
 DEFAULT_ADMIN_PIN = "9999"  # 관리자에서 변경 권장
-ROLES = ["협력사", "공사", "안전", "경비"]  # '공무' -> '공사'
+ROLES = ["협력사", "공사", "안전", "경비"]  # 공무 -> 공사
 REQ_STATUS = ["PENDING_APPROVAL", "APPROVED", "REJECTED", "EXECUTING", "DONE"]
-KIND_IN = "IN"    # 반입
-KIND_OUT = "OUT"  # 반출
-# 필수 실행 사진 키(3종)
+KIND_IN = "IN"
+KIND_OUT = "OUT"
 EXEC_REQUIRED_PHOTOS = [
     ("pre_load", "상차 전(촬영)"),
     ("post_load", "상차 후(촬영)"),
@@ -67,9 +72,32 @@ def b64_download_link(file_path: Path, label: str) -> str:
     b64 = base64.b64encode(data).decode()
     return f'<a href="data:application/octet-stream;base64,{b64}" download="{file_path.name}">{label}</a>'
 def infer_server_base_url() -> str:
-    # Streamlit 환경에서 완벽히 알 수 없으니, 접속자가 보는 host를 안내용으로 받는 구조 권장.
-    # 여기서는 세션에 저장된 "PUBLIC_BASE_URL"을 우선 사용.
     return st.session_state.get("PUBLIC_BASE_URL", "").strip()
+def bytes_from_camera_or_upload(upl) -> Optional[bytes]:
+    if upl is None:
+        return None
+    # st.camera_input returns UploadedFile-like with getvalue()
+    try:
+        return upl.getvalue()
+    except Exception:
+        try:
+            return upl.getbuffer()
+        except Exception:
+            return None
+def png_bytes_from_canvas_rgba(canvas_rgba) -> Optional[bytes]:
+    # canvas_rgba: numpy array (H,W,4)
+    if not CANVAS_AVAILABLE:
+        return None
+    try:
+        img = Image.fromarray(canvas_rgba.astype("uint8"), mode="RGBA")
+        # 투명 배경 -> 흰 배경 합성(현장 문서용)
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.alpha_composite(img)
+        out = io.BytesIO()
+        bg.convert("RGB").save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return None
 # -------------------------
 # Paths (Unified)
 # -------------------------
@@ -103,7 +131,6 @@ def con_open() -> sqlite3.Connection:
     return con
 def db_init_and_migrate(con: sqlite3.Connection) -> None:
     cur = con.cursor()
-    # settings
     cur.execute("""
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -111,18 +138,17 @@ def db_init_and_migrate(con: sqlite3.Connection) -> None:
       updated_at TEXT NOT NULL
     );
     """)
-    # requests (중요: id 컬럼 반드시)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS requests (
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       status TEXT NOT NULL,
-      kind TEXT NOT NULL,              -- IN/OUT
+      kind TEXT NOT NULL,
       company_name TEXT,
-      item_name TEXT,                  -- 자재/화물명
-      item_type TEXT,                  -- 자재종류/공종 등
-      work_type TEXT,                  -- 철근/고철 등
+      item_name TEXT,
+      item_type TEXT,
+      work_type TEXT,
       date TEXT,
       time_from TEXT,
       time_to TEXT,
@@ -135,18 +161,17 @@ def db_init_and_migrate(con: sqlite3.Connection) -> None:
       notes TEXT,
       requester_name TEXT,
       requester_role TEXT,
-      risk_level TEXT,                 -- LOW/MID/HIGH
-      sic_training_url TEXT            -- 요청별 교육 URL(없으면 default)
+      risk_level TEXT,
+      sic_training_url TEXT
     );
     """)
-    # approvals: 승인 스텝(할당)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY,
       req_id TEXT NOT NULL,
       step_no INTEGER NOT NULL,
-      role_required TEXT NOT NULL,     -- 안전/공사/경비
-      status TEXT NOT NULL,            -- PENDING/APPROVED/REJECTED
+      role_required TEXT NOT NULL,
+      status TEXT NOT NULL,
       signer_name TEXT,
       signer_role TEXT,
       sign_png_path TEXT,
@@ -157,32 +182,29 @@ def db_init_and_migrate(con: sqlite3.Connection) -> None:
       FOREIGN KEY(req_id) REFERENCES requests(id)
     );
     """)
-    # executions: 실행 등록(사진/점검카드)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executions (
       req_id TEXT PRIMARY KEY,
       executed_by TEXT,
       executed_role TEXT,
       executed_at TEXT,
-      check_json TEXT,                 -- 점검카드 응답 JSON
+      check_json TEXT,
       required_photo_ok INTEGER DEFAULT 0,
       notes TEXT,
       FOREIGN KEY(req_id) REFERENCES requests(id)
     );
     """)
-    # photos: 실행 사진들(필수3 + 옵션)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS photos (
       id TEXT PRIMARY KEY,
       req_id TEXT NOT NULL,
-      slot_key TEXT,                   -- pre_load/post_load/area_ctrl/optional
+      slot_key TEXT,
       label TEXT,
       file_path TEXT NOT NULL,
       created_at TEXT NOT NULL,
       FOREIGN KEY(req_id) REFERENCES requests(id)
     );
     """)
-    # outputs: 승인본/허가증/점검카드/번들 등 산출물
     cur.execute("""
     CREATE TABLE IF NOT EXISTS outputs (
       req_id TEXT PRIMARY KEY,
@@ -199,7 +221,6 @@ def db_init_and_migrate(con: sqlite3.Connection) -> None:
     );
     """)
     con.commit()
-    # 기본 settings 세팅
     def set_default(key: str, val: str):
         cur.execute("SELECT value FROM settings WHERE key=?", (key,))
         r = cur.fetchone()
@@ -210,12 +231,10 @@ def db_init_and_migrate(con: sqlite3.Connection) -> None:
     set_default("site_pin", DEFAULT_SITE_PIN)
     set_default("admin_pin", DEFAULT_ADMIN_PIN)
     set_default("sic_training_url_default", "https://example.com/visitor-training")
-    # 승인 라우팅 기본: OUT=안전->공사, IN=공사(단일) (관리자에서 바꿀 수 있게 JSON)
     set_default("approval_routing_json", json.dumps({
         "IN":  ["공사"],
         "OUT": ["안전", "공사"]
     }, ensure_ascii=False))
-    # 외부 공유용 base url(내부망/외부망에 따라 다름)
     set_default("public_base_url", "")
 def settings_get(con: sqlite3.Connection, key: str, default: str = "") -> str:
     cur = con.cursor()
@@ -319,9 +338,6 @@ def approvals_for_req(con: sqlite3.Connection, rid: str) -> List[Dict[str, Any]]
     return [dict(x) for x in cur.fetchall()]
 def approval_mark(con: sqlite3.Connection, approval_id: str, action: str, signer_name: str, signer_role: str,
                   sign_path: Optional[str], stamp_path: Optional[str], reject_reason: str = "") -> Tuple[str, str]:
-    """
-    returns (req_id, result_msg)
-    """
     cur = con.cursor()
     cur.execute("SELECT req_id, status FROM approvals WHERE id=?", (approval_id,))
     row = cur.fetchone()
@@ -337,7 +353,6 @@ def approval_mark(con: sqlite3.Connection, approval_id: str, action: str, signer
           WHERE id=?
         """, (signer_name, signer_role, sign_path, stamp_path, now_str(), approval_id))
         con.commit()
-        # 남은 pending?
         cur.execute("SELECT COUNT(*) AS cnt FROM approvals WHERE req_id=? AND status='PENDING'", (rid,))
         left = cur.fetchone()["cnt"]
         if left == 0:
@@ -379,7 +394,7 @@ def required_photos_ok(con: sqlite3.Connection, rid: str) -> bool:
     keys = set([p["slot_key"] for p in photos if p.get("slot_key")])
     return all(k in keys for k, _ in EXEC_REQUIRED_PHOTOS)
 # -------------------------
-# Check card (상/하차 점검카드)
+# Check card
 # -------------------------
 CHECK_ITEMS = [
     ("attendees", "0. 필수 참석자", "협력회사 담당자, 장비운전원, 차량운전원, 유도원, 안전보조원/감시단"),
@@ -494,13 +509,12 @@ def pdf_permit(con: sqlite3.Connection, req: Dict[str, Any], sic_url: str, qr_pa
     c.setFont("Helvetica", 9)
     c.drawString(20*mm, 174*mm, f"URL: {sic_url}")
     if qr_path and qr_path.exists():
-        # QR 이미지 삽입(대략)
         try:
             from reportlab.lib.utils import ImageReader
             img = ImageReader(str(qr_path))
             c.drawImage(img, 20*mm, 125*mm, width=45*mm, height=45*mm, preserveAspectRatio=True, mask='auto')
         except Exception:
-            c.drawString(20*mm, 160*mm, "(QR 삽입 실패 - 이미지 라이브러리 문제)")
+            c.drawString(20*mm, 160*mm, "(QR 삽입 실패)")
     c.setFont("Helvetica", 10)
     c.drawString(80*mm, 140*mm, "운전원 확인(서명): ____________________")
     c.drawString(80*mm, 130*mm, "담당자 확인(서명): ____________________")
@@ -517,8 +531,7 @@ def pdf_check_card(con: sqlite3.Connection, req: Dict[str, Any], check_json: Dic
     y = 240*mm
     for key, title, hint in CHECK_ITEMS:
         val = (check_json.get(key) or "").strip()
-        line = f"{title}: {val}"
-        c.drawString(20*mm, y, line)
+        c.drawString(20*mm, y, f"{title}: {val}")
         y -= 7*mm
         if y < 20*mm:
             c.showPage()
@@ -553,9 +566,7 @@ def outputs_upsert(con: sqlite3.Connection, rid: str, **paths: str) -> None:
     cur.execute("SELECT req_id FROM outputs WHERE req_id=?", (rid,))
     exists = cur.fetchone() is not None
     if not exists:
-        cur.execute("""
-          INSERT INTO outputs(req_id, created_at, updated_at) VALUES(?,?,?)
-        """, (rid, now_str(), now_str()))
+        cur.execute("INSERT INTO outputs(req_id, created_at, updated_at) VALUES(?,?,?)", (rid, now_str(), now_str()))
         con.commit()
     for k, v in paths.items():
         if v is None:
@@ -581,21 +592,16 @@ def generate_all_outputs(con: sqlite3.Connection, rid: str) -> Dict[str, str]:
     approvals = approvals_for_req(con, rid)
     exec_row = execution_get(con, rid)
     photos = photos_for_req(con, rid)
-    # 교육 URL
     sic_default = settings_get(con, "sic_training_url_default", "https://example.com/visitor-training")
     sic_url = (req.get("sic_training_url") or "").strip() or sic_default
-    # QR 생성
     qr_path = out["qr"] / f"{rid}_sic_qr.png"
     qr_saved = qr_generate_png(sic_url, qr_path) if QR_AVAILABLE else None
     if qr_saved:
         outputs_upsert(con, rid, qr_png_path=str(qr_saved))
-    # 계획서 PDF
     plan_pdf = out["pdf"] / f"{rid}_plan.pdf"
     pdf_plan(con, req, approvals, plan_pdf)
-    # 허가증 PDF
     permit_pdf = out["permit"] / f"{rid}_permit.pdf"
     pdf_permit(con, req, sic_url, qr_saved, permit_pdf)
-    # 점검카드 PDF (실행 등록이 있어야)
     check_pdf = None
     check_json = {}
     if exec_row and exec_row.get("check_json"):
@@ -605,10 +611,8 @@ def generate_all_outputs(con: sqlite3.Connection, rid: str) -> Dict[str, str]:
             check_json = {}
         check_pdf = out["check"] / f"{rid}_checkcard.pdf"
         pdf_check_card(con, req, check_json, check_pdf)
-    # 실행 요약 PDF
     exec_pdf = out["pdf"] / f"{rid}_exec.pdf"
     pdf_exec_summary(con, req, photos, exec_pdf)
-    # 번들 PDF (간단히 "계획서+허가증+점검+실행"을 ZIP으로 묶고, 번들 PDF는 안내용 1장)
     bundle_pdf = out["bundle"] / f"{rid}_bundle.pdf"
     c = canvas.Canvas(str(bundle_pdf), pagesize=A4)
     pdf_simple_header(c, "산출물 번들 안내", f"요청ID: {rid} · 생성: {now_str()} · {APP_VERSION}")
@@ -623,14 +627,12 @@ def generate_all_outputs(con: sqlite3.Connection, rid: str) -> Dict[str, str]:
     c.drawString(20*mm, 220*mm, f"저장 위치: {str(path_output_root())}")
     c.showPage()
     c.save()
-    # ZIP
     zip_path = out["zip"] / f"{rid}_outputs.zip"
     include = [plan_pdf, permit_pdf, exec_pdf, bundle_pdf]
     if check_pdf:
         include.append(check_pdf)
     if qr_saved:
         include.append(qr_saved)
-    # 사진 파일들도 포함
     for p in photos:
         fp = Path(p["file_path"])
         if fp.exists():
@@ -656,72 +658,35 @@ def generate_all_outputs(con: sqlite3.Connection, rid: str) -> Dict[str, str]:
         "root": str(path_output_root()),
     }
 # -------------------------
-# UI / Styling (Light, App-like)
+# UI / Styling
 # -------------------------
 def inject_css():
     st.markdown("""
     <style>
-    :root{
-      --bg:#f6f8fb;
-      --card:#ffffff;
-      --text:#0f172a;
-      --muted:#64748b;
-      --line:#e2e8f0;
-      --brand:#2563eb;
-      --brand2:#06b6d4;
-      --danger:#ef4444;
-      --ok:#16a34a;
-      --shadow: 0 10px 30px rgba(2,6,23,.08);
-      --radius: 18px;
-    }
+    :root{ --bg:#f6f8fb; --card:#ffffff; --text:#0f172a; --muted:#64748b; --line:#e2e8f0;
+      --brand:#2563eb; --brand2:#06b6d4; --danger:#ef4444; --ok:#16a34a;
+      --shadow: 0 10px 30px rgba(2,6,23,.08); --radius: 18px; }
     html, body, [class*="css"] { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",sans-serif; }
     .stApp { background: var(--bg); }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 16px 18px;
-    }
-    .hero {
-      background: linear-gradient(135deg, rgba(37,99,235,.95), rgba(6,182,212,.85));
-      color: white;
-      border-radius: 22px;
-      padding: 18px 18px;
-      box-shadow: var(--shadow);
-      border: 1px solid rgba(255,255,255,.18);
-    }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+      box-shadow: var(--shadow); padding: 16px 18px; }
+    .hero { background: linear-gradient(135deg, rgba(37,99,235,.95), rgba(6,182,212,.85));
+      color: white; border-radius: 22px; padding: 18px 18px; box-shadow: var(--shadow);
+      border: 1px solid rgba(255,255,255,.18); }
     .hero .title { font-size: 20px; font-weight: 800; margin-bottom: 4px; }
     .hero .sub { font-size: 12px; opacity: .9; }
     .kpi { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
-    .kpi .box {
-      flex:1; min-width:140px;
-      background: rgba(255,255,255,.12);
-      border:1px solid rgba(255,255,255,.18);
-      border-radius: 16px;
-      padding: 10px 12px;
-    }
+    .kpi .box { flex:1; min-width:140px; background: rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.18);
+      border-radius: 16px; padding: 10px 12px; }
     .kpi .n { font-size: 20px; font-weight: 800; }
     .kpi .l { font-size: 11px; opacity:.92; letter-spacing:.3px; }
-    .pill{
-      display:inline-block; padding:4px 10px; border-radius:999px;
-      border:1px solid var(--line); background:#fff; font-size:12px; color:var(--muted);
-      margin-right:6px;
-    }
-    .danger{ color: var(--danger); font-weight:700; }
-    .ok{ color: var(--ok); font-weight:700; }
-    .muted{ color: var(--muted); }
-    .small{ font-size:12px; }
-    .section-title{ font-size:15px; font-weight:800; margin:6px 0 10px; color: var(--text); }
+    .pill{ display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid var(--line);
+      background:#fff; font-size:12px; color:var(--muted); margin-right:6px; }
+    .small{ font-size:12px; } .muted{ color: var(--muted); }
     .stTabs [data-baseweb="tab-list"] { gap: 6px; }
-    .stTabs [data-baseweb="tab"]{
-      background:#fff; border:1px solid var(--line); border-radius: 999px;
-      padding: 8px 14px; box-shadow: 0 2px 10px rgba(2,6,23,.04);
-    }
-    .stTabs [aria-selected="true"]{
-      border-color: rgba(37,99,235,.35);
-      box-shadow: 0 10px 20px rgba(37,99,235,.14);
-    }
+    .stTabs [data-baseweb="tab"]{ background:#fff; border:1px solid var(--line); border-radius: 999px;
+      padding: 8px 14px; box-shadow: 0 2px 10px rgba(2,6,23,.04); }
+    .stTabs [aria-selected="true"]{ border-color: rgba(37,99,235,.35); box-shadow: 0 10px 20px rgba(37,99,235,.14); }
     </style>
     """, unsafe_allow_html=True)
 # -------------------------
@@ -741,23 +706,23 @@ def auth_login(con: sqlite3.Connection, site_pin: str, name: str, role: str, is_
         return False, "이름/직책을 입력해주세요."
     if role not in ROLES:
         return False, "역할 선택이 올바르지 않습니다."
-    if is_admin:
-        if admin_pin != ap:
-            return False, "Admin PIN이 올바르지 않습니다."
+    if is_admin and admin_pin != ap:
+        return False, "Admin PIN이 올바르지 않습니다."
     st.session_state["AUTH_OK"] = True
     st.session_state["IS_ADMIN"] = bool(is_admin)
     st.session_state["USER_NAME"] = name.strip()
     st.session_state["USER_ROLE"] = role
     return True, "로그인 완료"
 # -------------------------
-# Share message (Kakao group paste)
+# Share text
 # -------------------------
 def make_share_text(req: Dict[str, Any], outs: Optional[Dict[str, Any]]) -> str:
     kind_txt = "반입" if req["kind"] == KIND_IN else "반출"
     rid = req["id"]
     base_url = infer_server_base_url()
-    # 페이지 링크(내부망이면 IP:PORT)
     link = f"{base_url}?rid={rid}" if base_url else f"(내부망 접속주소 설정 필요) 요청ID={rid}"
+    def nm(p):
+        return Path(p).name if p else ""
     lines = []
     lines.append(f"[자재 {kind_txt} 안내] {req.get('date','')} {req.get('time_from','')}~{req.get('time_to','')} / GATE:{req.get('gate','')}")
     lines.append(f"- 협력사: {req.get('company_name','')} / 자재: {req.get('item_name','')}")
@@ -765,9 +730,6 @@ def make_share_text(req: Dict[str, Any], outs: Optional[Dict[str, Any]]) -> str:
     lines.append(f"- 상태: {req.get('status','')}")
     lines.append(f"- 상세/산출물: {link}")
     if outs:
-        # 파일명만 공유(실제 파일은 내부망에서 열람/다운로드)
-        def nm(p):
-            return Path(p).name if p else ""
         lines.append("— 산출물 —")
         if outs.get("plan_pdf_path"): lines.append(f"  · 계획서PDF: {nm(outs.get('plan_pdf_path'))}")
         if outs.get("permit_pdf_path"): lines.append(f"  · 허가증PDF(QR): {nm(outs.get('permit_pdf_path'))}")
@@ -777,21 +739,131 @@ def make_share_text(req: Dict[str, Any], outs: Optional[Dict[str, Any]]) -> str:
     lines.append("※ 단톡방에는 위 문구를 그대로 붙여넣고, 파일은 내부망에서 열람/다운로드하세요.")
     return "\n".join(lines)
 # -------------------------
-# UI Pages
+# Signature (direct draw + optional upload)
+# -------------------------
+def save_bytes_to_file(folder_key: str, rid: str, tag: str, data: bytes, suffix: str) -> str:
+    out = path_output("X")[folder_key]
+    fp = out / f"{rid}_{tag}_{uuid.uuid4().hex[:8]}{suffix}"
+    fp.write_bytes(data)
+    return str(fp)
+def ui_signature_block(rid: str, label: str, key_prefix: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    returns (sign_path, stamp_path)
+    - sign: direct draw preferred, else optional upload
+    - stamp: optional upload
+    """
+    st.markdown(f"#### {label}")
+    sign_path = None
+    stamp_path = None
+    mode = st.radio("서명 방식", ["직접 서명(권장)", "이미지 업로드(옵션)"], horizontal=True, key=f"{key_prefix}_mode")
+    if mode == "직접 서명(권장)":
+        if not CANVAS_AVAILABLE:
+            st.warning("직접 서명 기능을 사용하려면 패키지 설치가 필요합니다: streamlit-drawable-canvas, pillow")
+        else:
+            st.caption("손가락/펜으로 서명하세요. (지우기: Clear)")
+            canvas_res = st_canvas(
+                fill_color="rgba(255, 255, 255, 0)",
+                stroke_width=4,
+                stroke_color="#111111",
+                background_color="#ffffff",
+                height=180,
+                width=520,
+                drawing_mode="freedraw",
+                key=f"{key_prefix}_canvas",
+            )
+            colA, colB = st.columns(2)
+            with colA:
+                if st.button("서명 저장", key=f"{key_prefix}_save", use_container_width=True):
+                    if canvas_res.image_data is None:
+                        st.error("서명이 없습니다.")
+                    else:
+                        png = png_bytes_from_canvas_rgba(canvas_res.image_data)
+                        if not png:
+                            st.error("서명 저장 실패")
+                        else:
+                            sign_path = save_bytes_to_file("sign", rid, "sign_draw", png, ".png")
+                            st.success("서명 저장 완료")
+            with colB:
+                st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True)
+            # 저장된 서명 경로는 세션에 보관(버튼 클릭 후 rerun 되므로)
+            if sign_path:
+                st.session_state[f"{key_prefix}_sign_path"] = sign_path
+            sign_path = st.session_state.get(f"{key_prefix}_sign_path", None)
+    else:
+        upl = st.file_uploader("서명 이미지 업로드(PNG/JPG)", type=["png", "jpg", "jpeg"], key=f"{key_prefix}_sign_upload")
+        if upl:
+            data = bytes_from_camera_or_upload(upl)
+            if data:
+                suffix = Path(upl.name).suffix.lower() or ".png"
+                sign_path = save_bytes_to_file("sign", rid, "sign_upl", data, suffix)
+                st.session_state[f"{key_prefix}_sign_path"] = sign_path
+                st.success("서명 이미지 저장 완료")
+        sign_path = st.session_state.get(f"{key_prefix}_sign_path", None)
+    st.divider()
+    st.caption("도장(옵션)")
+    stamp_upl = st.file_uploader("도장 이미지 업로드(옵션)", type=["png", "jpg", "jpeg"], key=f"{key_prefix}_stamp_upload")
+    if stamp_upl:
+        data = bytes_from_camera_or_upload(stamp_upl)
+        if data:
+            suffix = Path(stamp_upl.name).suffix.lower() or ".png"
+            stamp_path = save_bytes_to_file("sign", rid, "stamp", data, suffix)
+            st.session_state[f"{key_prefix}_stamp_path"] = stamp_path
+            st.success("도장 이미지 저장 완료")
+    stamp_path = st.session_state.get(f"{key_prefix}_stamp_path", None)
+    return sign_path, stamp_path
+# -------------------------
+# Camera (direct capture + optional upload)
+# -------------------------
+def ui_photo_capture_required(con: sqlite3.Connection, rid: str):
+    st.markdown("#### 1) 실행 사진(필수 3종) — 직접 촬영")
+    st.caption("모바일에서는 아래 촬영 버튼을 누르면 카메라로 바로 촬영됩니다. (촬영이 안 되는 환경이면 업로드로 대체 가능)")
+    for key, label in EXEC_REQUIRED_PHOTOS:
+        st.markdown(f"**{label}***")
+        cam = st.camera_input(label, key=f"cam_{rid}_{key}")
+        if cam is not None:
+            data = bytes_from_camera_or_upload(cam)
+            if data:
+                photo_add(con, rid, key, label, data, suffix=".jpg")
+                st.success(f"촬영 저장 완료: {label}")
+        # 예외적으로 PC/차단환경 대비: 업로드 대체(숨김이 아니라 "대체수단"으로 노출)
+        with st.expander("촬영이 안되면(대체) 파일 업로드"):
+            upl = st.file_uploader(f"{label} 업로드", type=["png", "jpg", "jpeg"], key=f"upl_{rid}_{key}")
+            if upl:
+                data2 = bytes_from_camera_or_upload(upl)
+                if data2:
+                    suffix = Path(upl.name).suffix.lower() or ".jpg"
+                    photo_add(con, rid, key, label, data2, suffix=suffix)
+                    st.success(f"업로드 저장 완료: {label}")
+def ui_photo_optional_upload(con: sqlite3.Connection, rid: str):
+    st.markdown("#### 2) 추가 사진(옵션) — 업로드")
+    opt = st.file_uploader("추가 사진 업로드(여러 장 가능)", type=["png","jpg","jpeg"], accept_multiple_files=True, key=f"opt_{rid}")
+    if opt:
+        for f in opt:
+            data = bytes_from_camera_or_upload(f)
+            if data:
+                suffix = Path(f.name).suffix.lower() or ".jpg"
+                photo_add(con, rid, "optional", f"추가사진({f.name})", data, suffix=suffix)
+        st.success(f"추가 사진 {len(opt)}장 업로드 완료")
+# -------------------------
+# Pages
 # -------------------------
 def ui_header(con: sqlite3.Connection):
     site_name = settings_get(con, "site_name", DEFAULT_SITE_NAME)
     user = st.session_state.get("USER_NAME", "")
     role = st.session_state.get("USER_ROLE", "")
+    total = len(req_list(con, None, None, 9999))
+    pend = len(req_list(con, "PENDING_APPROVAL", None, 9999))
+    appr = len(req_list(con, "APPROVED", None, 9999))
+    rej = len(req_list(con, "REJECTED", None, 9999))
     st.markdown(f"""
       <div class="hero">
         <div class="title">{APP_TITLE}</div>
         <div class="sub">현장: {site_name} · 사용자: {user} ({role}) · {APP_VERSION}</div>
         <div class="kpi">
-          <div class="box"><div class="n">{len(req_list(con, None, None, 9999))}</div><div class="l">TOTAL</div></div>
-          <div class="box"><div class="n">{len(req_list(con, "PENDING_APPROVAL", None, 9999))}</div><div class="l">PENDING</div></div>
-          <div class="box"><div class="n">{len(req_list(con, "APPROVED", None, 9999))}</div><div class="l">APPROVED</div></div>
-          <div class="box"><div class="n">{len(req_list(con, "REJECTED", None, 9999))}</div><div class="l">REJECTED</div></div>
+          <div class="box"><div class="n">{total}</div><div class="l">TOTAL</div></div>
+          <div class="box"><div class="n">{pend}</div><div class="l">PENDING</div></div>
+          <div class="box"><div class="n">{appr}</div><div class="l">APPROVED</div></div>
+          <div class="box"><div class="n">{rej}</div><div class="l">REJECTED</div></div>
         </div>
       </div>
     """, unsafe_allow_html=True)
@@ -811,10 +883,6 @@ def page_login(con: sqlite3.Connection):
             admin_pin = st.text_input("Admin PIN*", type="password", placeholder="관리자 전용")
         st.caption("방문자교육 URL(기본값)")
         st.code(settings_get(con, "sic_training_url_default", "https://example.com/visitor-training"), language="text")
-        st.caption("QR 미리보기/테스트")
-        test_url = settings_get(con, "sic_training_url_default", "https://example.com/visitor-training")
-        if st.button("방문자교육 링크 열기"):
-            st.markdown(f"[방문자교육 링크 열기]({test_url})")
     if st.button("로그인", type="primary", use_container_width=True):
         ok, msg = auth_login(con, site_pin, name, role, is_admin, admin_pin)
         if ok:
@@ -826,7 +894,6 @@ def page_login(con: sqlite3.Connection):
 def page_request(con: sqlite3.Connection):
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 📝 요청 등록(협력사/현장)")
-    st.caption("반입/반출 데이터를 입력하면 계획서·허가증·QR·점검카드·실행기록까지 한 흐름으로 연결됩니다.")
     c1, c2 = st.columns(2)
     with c1:
         kind = st.radio("구분", [("반입(IN)", KIND_IN), ("반출(OUT)", KIND_OUT)], horizontal=True)
@@ -879,7 +946,7 @@ def page_request(con: sqlite3.Connection):
 def page_approval(con: sqlite3.Connection):
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### ✍️ 승인(서명)")
-    st.caption("내 역할(또는 관리자) 기준으로 '내 승인함'이 표시됩니다. 승인 완료 시 최종 승인되면 승인본 PDF가 자동 생성됩니다.")
+    st.caption("서명은 '직접 서명'이 기본이며, 필요 시 이미지 업로드도 가능합니다.")
     is_admin = st.session_state.get("IS_ADMIN", False)
     role = st.session_state.get("USER_ROLE", "")
     inbox = approvals_inbox(con, role, is_admin)
@@ -887,14 +954,12 @@ def page_approval(con: sqlite3.Connection):
         st.info("현재 대기 중인 승인 건이 없습니다.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
-    # 승인 선택
     items = []
     for it in inbox:
         kind_txt = "반입" if it["kind"] == KIND_IN else "반출"
         items.append((f"[{it['role_required']}] {kind_txt} · {it.get('company_name','')} · {it.get('item_name','')} · {it.get('date','')} {it.get('time_from','')}~{it.get('time_to','')} · {it.get('gate','')}", it["id"]))
     label, approval_id = st.selectbox("승인 대상 선택", items, format_func=lambda x: x[0])
     approval_id = approval_id[1] if isinstance(approval_id, tuple) else approval_id
-    # 현재 선택 승인 정보
     target = next((x for x in inbox if x["id"] == approval_id), None)
     if not target:
         st.error("승인 데이터를 찾지 못했습니다.")
@@ -905,35 +970,19 @@ def page_approval(con: sqlite3.Connection):
     st.markdown(f"- 요청ID: **{rid}** / 상태: **{req.get('status','')}**")
     st.markdown(f"- 승인 단계: **{target['step_no']}** / 요구 역할: **{target['role_required']}**")
     st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        sign_img = st.file_uploader("서명 이미지(PNG 권장)", type=["png","jpg","jpeg"], key="sign_upl")
-    with c2:
-        stamp_img = st.file_uploader("도장 이미지(옵션)", type=["png","jpg","jpeg"], key="stamp_upl")
+    sign_path, stamp_path = ui_signature_block(rid, "서명 입력", key_prefix=f"ap_{approval_id}")
     reject_reason = st.text_area("반려 사유(반려 시 필수)", height=80)
-    # 저장
-    def save_upload(file, folder_key: str, suffix_default: str = ".png") -> Optional[str]:
-        if not file:
-            return None
-        out = path_output("X")[folder_key]
-        suffix = Path(file.name).suffix.lower() or suffix_default
-        fp = out / f"{rid}_{folder_key}_{uuid.uuid4().hex[:8]}{suffix}"
-        fp.write_bytes(file.getbuffer())
-        return str(fp)
     colA, colB = st.columns(2)
     with colA:
         if st.button("승인(서명 저장)", type="primary", use_container_width=True):
-            if not sign_img:
-                st.error("승인하려면 서명 이미지가 필요합니다.")
+            if not sign_path:
+                st.error("서명이 필요합니다. (직접 서명 저장 또는 이미지 업로드)")
             else:
-                sign_path = save_upload(sign_img, "sign")
-                stamp_path = save_upload(stamp_img, "sign")
                 rid2, msg = approval_mark(con, approval_id, "APPROVE",
                                           st.session_state.get("USER_NAME",""),
                                           st.session_state.get("USER_ROLE",""),
                                           sign_path, stamp_path, "")
                 st.success(msg)
-                # 최종 승인 완료면 승인본 산출 생성
                 req2 = req_get(con, rid2)
                 if req2 and req2["status"] == "APPROVED":
                     try:
@@ -959,8 +1008,7 @@ def page_approval(con: sqlite3.Connection):
 def page_execute(con: sqlite3.Connection):
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 📸 실행 등록(사진 + 점검카드)")
-    st.caption("승인 완료된 건에 대해 실행 사진(필수 3종) + 추가 사진(옵션)을 등록하고, 점검카드를 작성합니다.")
-    # 대상 선택: APPROVED / EXECUTING / DONE 모두 가능
+    st.caption("필수 3종은 '직접 촬영'이 기본, 추가 사진은 업로드(옵션)입니다.")
     candidates = req_list(con, None, None, 500)
     if not candidates:
         st.info("요청이 없습니다.")
@@ -981,35 +1029,21 @@ def page_execute(con: sqlite3.Connection):
         st.error("요청을 찾지 못했습니다.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
-    if req["status"] not in ["APPROVED","EXECUTING","DONE"]:
-        st.warning("이 건은 아직 승인 완료가 아닙니다. (승인 완료 후 실행 등록 권장)")
-    else:
+    if req["status"] in ["APPROVED","EXECUTING","DONE"]:
         req_update_status(con, rid, "EXECUTING")
-    st.markdown(f"- 상태: **{req.get('status','')}** (실행 등록 시 EXECUTING으로 관리)")
+    else:
+        st.warning("이 건은 아직 승인 완료가 아닙니다. (승인 완료 후 실행 등록 권장)")
     st.divider()
-    # 사진 업로드
-    st.markdown("#### 1) 실행 사진(필수 3종)")
-    for key, label in EXEC_REQUIRED_PHOTOS:
-        upl = st.file_uploader(f"{label} *", type=["png","jpg","jpeg"], key=f"reqphoto_{key}")
-        if upl:
-            photo_add(con, rid, key, label, upl.getbuffer(), suffix=Path(upl.name).suffix.lower() or ".jpg")
-            st.success(f"업로드 완료: {label}")
-    st.markdown("#### 2) 추가 사진(옵션)")
-    opt = st.file_uploader("추가 사진 업로드(여러 장 가능)", type=["png","jpg","jpeg"], accept_multiple_files=True, key="optphotos")
-    if opt:
-        for f in opt:
-            photo_add(con, rid, "optional", f"추가사진({f.name})", f.getbuffer(), suffix=Path(f.name).suffix.lower() or ".jpg")
-        st.success(f"추가 사진 {len(opt)}장 업로드 완료")
-    # 현재 사진 목록
+    ui_photo_capture_required(con, rid)
+    ui_photo_optional_upload(con, rid)
     photos = photos_for_req(con, rid)
     ok = required_photos_ok(con, rid)
     st.markdown(f"- 필수 3종 충족: {'✅' if ok else '❌'}")
     if photos:
-        with st.expander("업로드된 사진 목록 보기"):
+        with st.expander("업로드/촬영된 사진 목록 보기"):
             for p in photos:
                 st.write(f"- [{p['slot_key']}] {p['label']} · {Path(p['file_path']).name}")
     st.divider()
-    # 점검카드
     st.markdown("#### 3) 자재 상/하차 점검카드")
     exec_row = execution_get(con, rid)
     existing = {}
@@ -1032,7 +1066,6 @@ def page_execute(con: sqlite3.Connection):
         else:
             execution_upsert(con, rid, st.session_state.get("USER_NAME",""), st.session_state.get("USER_ROLE",""), check_json, notes)
             req_update_status(con, rid, "DONE")
-            # 산출물 생성
             try:
                 generate_all_outputs(con, rid)
                 st.success("실행 등록 완료 + 산출물(PDF/QR/ZIP) 생성 완료")
@@ -1044,7 +1077,6 @@ def page_execute(con: sqlite3.Connection):
 def page_outputs(con: sqlite3.Connection):
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 📦 산출물/다운로드/공유")
-    st.caption("승인본/허가증(QR)/점검카드/실행요약/ZIP을 한 화면에서 확인합니다. 일반 카톡 단톡에는 공유문구를 붙여넣고 내부망에서 파일을 열람하세요.")
     allreq = req_list(con, None, None, 500)
     if not allreq:
         st.info("요청이 없습니다.")
@@ -1072,11 +1104,9 @@ def page_outputs(con: sqlite3.Connection):
     st.divider()
     st.markdown("#### 산출물 생성 위치(통합)")
     st.code(str(path_output_root()), language="text")
-    st.caption("폴더 구조: output/pdf, output/permit, output/check, output/qr, output/zip, output/photos, output/sign, output/bundle")
     if not outs:
         st.warning("아직 산출물이 없습니다. (승인 완료 또는 실행 등록 후 생성됩니다)")
     else:
-        # 링크/다운로드
         st.markdown("#### 파일")
         def show_file(key: str, title: str):
             p = outs.get(key,"")
@@ -1093,8 +1123,7 @@ def page_outputs(con: sqlite3.Connection):
         show_file("zip_path", "ZIP(일괄)")
     st.divider()
     st.markdown("#### 카톡 단톡 공유문구(붙여넣기용)")
-    share_txt = make_share_text(req, outs)
-    st.text_area("복사해서 단톡방에 붙여넣으세요", value=share_txt, height=220)
+    st.text_area("복사해서 단톡방에 붙여넣으세요", value=make_share_text(req, outs), height=220)
     st.markdown("</div>", unsafe_allow_html=True)
 def page_ledger(con: sqlite3.Connection):
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1104,7 +1133,6 @@ def page_ledger(con: sqlite3.Connection):
         st.info("데이터가 없습니다.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
-    # 간단 필터
     c1, c2, c3 = st.columns(3)
     with c1:
         f_kind = st.selectbox("구분", ["ALL","IN","OUT"], index=0)
@@ -1143,13 +1171,11 @@ def page_admin(con: sqlite3.Connection):
     sic_default = st.text_input("방문자교육 URL 기본값", value=settings_get(con,"sic_training_url_default","https://example.com/visitor-training"))
     st.divider()
     st.markdown("#### 승인 라우팅(현장 방식)")
-    st.caption("기본: 반입(IN)=공사, 반출(OUT)=안전→공사. 필요 시 경비를 추가하세요.")
     routing = routing_get(con)
     in_route = st.text_input("반입(IN) 승인 순서(쉼표구분)", value=",".join(routing.get("IN",["공사"])))
     out_route = st.text_input("반출(OUT) 승인 순서(쉼표구분)", value=",".join(routing.get("OUT",["안전","공사"])))
     st.divider()
     st.markdown("#### 외부/내부 공유용 Base URL")
-    st.caption("카톡 공유문구의 링크를 채우려면, 내부망/외부망 접속주소를 넣으세요. 예) http://59.11.xx.xx:8501")
     public_base_url = st.text_input("PUBLIC_BASE_URL", value=settings_get(con,"public_base_url",""))
     if st.button("설정 저장", type="primary", use_container_width=True):
         settings_set(con, "site_name", site_name.strip() or DEFAULT_SITE_NAME)
@@ -1158,7 +1184,6 @@ def page_admin(con: sqlite3.Connection):
         settings_set(con, "sic_training_url_default", sic_default.strip() or "https://example.com/visitor-training")
         def parse_route(s: str) -> List[str]:
             parts = [x.strip() for x in s.split(",") if x.strip()]
-            # 허용 역할만
             parts = [p for p in parts if p in ROLES]
             return parts or ["공사"]
         routing2 = {"IN": parse_route(in_route), "OUT": parse_route(out_route)}
@@ -1168,8 +1193,7 @@ def page_admin(con: sqlite3.Connection):
         st.success("저장 완료")
         st.rerun()
     st.divider()
-    st.markdown("#### 데이터/산출물 초기화(테스트용)")
-    if st.button("⚠️ 산출물 폴더(output) 비우기", use_container_width=True):
+    if st.button("⚠️ 산출물 폴더(output) 비우기(테스트용)", use_container_width=True):
         out = path_output_root()
         if out.exists():
             shutil.rmtree(out)
@@ -1185,15 +1209,12 @@ def main():
     inject_css()
     if "AUTH_OK" not in st.session_state:
         auth_reset()
-    # Base dir session
     if "BASE_DIR" not in st.session_state:
         st.session_state["BASE_DIR"] = DEFAULT_BASE_DIR
     con = con_open()
     db_init_and_migrate(con)
-    # Load public base url into session for share text
     if "PUBLIC_BASE_URL" not in st.session_state:
         st.session_state["PUBLIC_BASE_URL"] = settings_get(con, "public_base_url", "")
-    # Sidebar (minimal)
     with st.sidebar:
         st.markdown("## ⚙️ 사용자/환경")
         st.text_input("BASE 폴더(통합)", value=st.session_state["BASE_DIR"], key="base_dir_ui")
@@ -1214,31 +1235,22 @@ def main():
         st.markdown("---")
         st.caption("산출물 위치")
         st.code(str(path_output_root()), language="text")
-    # If not logged in, show login page only
+        if not CANVAS_AVAILABLE:
+            st.warning("직접서명(캔버스) 사용 시 설치 필요:\n- streamlit-drawable-canvas\n- pillow")
     if not st.session_state.get("AUTH_OK", False):
         page_login(con)
         return
-    # Header
     ui_header(con)
-    # Tabs (mobile-friendly)
     tabs = st.tabs(["홈", "요청", "승인", "실행", "산출물", "대장", "관리자"])
     with tabs[0]:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### 🏠 홈")
-        st.caption("현장 운영 흐름을 탭으로 따라가면 됩니다. (요청 → 승인 → 실행 → 산출물 → 공유)")
         st.markdown("""
-        - **협력사**: 요청 등록(반입/반출)
-        - **안전/공사/경비**: 승인함에서 서명 승인
-        - **실행 담당**: 필수 사진 3종 + 점검카드 작성 후 실행 등록
-        - **산출물**: 계획서/허가증(QR)/점검카드/실행요약/ZIP 생성 및 단톡 공유문구 제공
+        - **요청**: 협력사 입력
+        - **승인**: 안전/공사/경비 서명 승인(직접서명 기본)
+        - **실행**: 필수 3종 '직접 촬영' + 점검카드 + (추가사진 업로드 옵션)
+        - **산출물**: PDF/QR/ZIP 생성 + 단톡 붙여넣기용 공유문구 제공
         """)
-        st.markdown("#### 빠른 상태 안내")
-        st.markdown(f"""
-        <span class="pill">PENDING: 승인대기</span>
-        <span class="pill">APPROVED: 승인완료</span>
-        <span class="pill">EXECUTING: 실행중</span>
-        <span class="pill">DONE: 완료</span>
-        """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
     with tabs[1]:
         page_request(con)

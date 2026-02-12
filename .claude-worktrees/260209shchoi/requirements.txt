@@ -2,3 +2,4 @@ streamlit>=1.30.0
 qrcode[pil]
 Pillow
 reportlab
+streamlit-drawable-canvas
