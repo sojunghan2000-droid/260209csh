@@ -1,4 +1,8 @@
-streamlit>=1.30.0
-Pillow>=10.0.0
-google-cloud-aiplatform>=1.38.0
-google-auth>=2.23.0
+streamlit
+google-cloud-aiplatform
+google-auth
+protobuf
+numpy
+pandas
+Pillow
+opencv-python-headless
