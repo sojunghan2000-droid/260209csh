@@ -1244,12 +1244,12 @@ def inject_css():
         display: block !important;
         margin-bottom: 12px !important;
       }
-      /* Step 1: sched_col_right 숨김 */
-      .st-key-sched_col_right_step1 {
+      /* Step 1: 오른쪽 열(예약폼) 숨김 */
+      .st-key-sched_layout_step1 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
         display: none !important;
       }
-      /* Step 2: sched_col_left 숨김 */
-      .st-key-sched_col_left_step2 {
+      /* Step 2: 왼쪽 열(타임라인) 숨김 */
+      .st-key-sched_layout_step2 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
         display: none !important;
       }
     }

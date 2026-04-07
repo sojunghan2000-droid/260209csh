@@ -165,15 +165,13 @@ def page_schedule(con):
     schedule_sync_from_requests(con, project_id)
 
     mobile_step = st.session_state.get("sched_mobile_step", 1)
-    col_left, col_right = st.columns([3, 2], gap="large")
+    _layout_key = "sched_layout_step1" if mobile_step == 1 else "sched_layout_step2"
 
-    # ── LEFT: 날짜 네비 + 타임라인 ───────────────────────────────────────────
-    # 모바일 step2에서 숨기기 위해 key 변경
-    _left_key  = "sched_col_left_step2"  if mobile_step == 2 else "sched_col_left_step1"
-    _right_key = "sched_col_right_step1" if mobile_step == 1 else "sched_col_right_step2"
+    with st.container(key=_layout_key):
+        col_left, col_right = st.columns([3, 2], gap="large")
 
-    with col_left:
-        with st.container(key=_left_key):
+        # ── LEFT: 날짜 네비 + 타임라인 ─────────────────────────────────────────
+        with col_left:
             st.markdown("#### 📅 일정 현황")
 
             with st.container(key="sched_nav_row"):
@@ -245,9 +243,8 @@ def page_schedule(con):
                         st.session_state["sched_mobile_step"] = 2
                         st.rerun()
 
-    # ── RIGHT: 반입·반출 예약 신청 (슬롯 선택 시 기존 정보 자동 입력) ────────
-    with col_right:
-        with st.container(key=_right_key):
+        # ── RIGHT: 반입·반출 예약 신청 (슬롯 선택 시 기존 정보 자동 입력) ────────
+        with col_right:
             # ── 모바일 "뒤로가기" 버튼 ────────────────────────────────────────
             with st.container(key="sched_mobile_back_wrap"):
                 if st.button("← 뒤로가기", key="sched_mobile_back", use_container_width=False):
