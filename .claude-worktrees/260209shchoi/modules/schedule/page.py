@@ -4,7 +4,6 @@ from datetime import date, timedelta
 
 from modules.schedule.crud import schedule_list_by_date, schedule_sync_from_requests
 from modules.schedule.components.timeline import render_timeline, BLOCKING_STATUSES
-from modules.schedule.components.dnd_timeline import dnd_timeline
 from modules.schedule.components.summary import render_daily_summary
 from modules.schedule.css.schedule import get_schedule_css
 from modules.request.crud import req_insert, req_update_time, req_get
@@ -220,100 +219,7 @@ def page_schedule(con):
         for s in schedules:
             s["requester_name"] = _rmap.get(s.get("req_id", ""), "")
 
-        if is_admin:
-            in_items  = [s for s in schedules if s.get("kind") == KIND_IN]
-            out_items = [s for s in schedules if s.get("kind") == KIND_OUT]
-            dnd_result = dnd_timeline(
-                slots=TIME_SLOTS,
-                in_schedules=in_items,
-                out_schedules=out_items,
-                is_admin=True,
-                sel_ids=list(st.session_state.get("admin_sel_sched_ids", [])),
-                sel_in_slots=st.session_state.get("sched_sel_in_slots", []),
-                sel_out_slots=st.session_state.get("sched_sel_out_slots", []),
-                admin_sel_kind=st.session_state.get("admin_sel_sched_kind"),
-                key="admin_dnd",
-            )
-            # 새 이벤트인지 확인 (ts 기반 중복 방지)
-            if dnd_result and dnd_result.get("ts") != st.session_state.get("_dnd_ts"):
-                st.session_state["_dnd_ts"] = dnd_result["ts"]
-                action = dnd_result.get("action")
-
-                if action == "select":
-                    # 관리자 슬롯 선택/해제
-                    sid   = dnd_result["sched_id"]
-                    kind_ = dnd_result["kind"]
-                    sched_ = next((s for s in schedules if s["id"] == sid), None)
-                    if sched_:
-                        ids  = set(st.session_state.get("admin_sel_sched_ids", []))
-                        lst  = list(st.session_state.get("admin_sel_sched_list", []))
-                        prev = st.session_state.get("admin_sel_sched_kind")
-                        if prev and prev != kind_:
-                            ids, lst = set(), []
-                        if sid in ids:
-                            ids.discard(sid)
-                            lst = [s for s in lst if s["id"] != sid]
-                        else:
-                            ids.add(sid)
-                            lst.append(sched_)
-                        st.session_state["admin_sel_sched_ids"]  = list(ids)
-                        st.session_state["admin_sel_sched_list"] = lst
-                        st.session_state["admin_sel_sched_kind"] = kind_ if ids else None
-                    st.rerun()
-
-                elif action == "move":
-                    # 드래그로 단일 슬롯 이동
-                    st.session_state["admin_dnd_move"] = {
-                        "sched_id": dnd_result["sched_id"],
-                        "to_slot":  dnd_result["to_slot"],
-                    }
-                    st.rerun()
-
-                elif action == "move_click":
-                    # 이동 버튼 클릭 → 선택된 모든 슬롯 이동
-                    st.session_state["admin_move_slot"] = dnd_result["to_slot"]
-                    st.session_state["admin_move_kind"] = dnd_result.get("kind")
-                    st.rerun()
-
-                elif action == "toggle_book":
-                    key_ = "sched_sel_in_slots" if dnd_result["kind"] == KIND_IN else "sched_sel_out_slots"
-                    lst  = list(st.session_state.get(key_, []))
-                    st.session_state[key_] = _consecutive_toggle(lst, dnd_result["slot"])
-                    st.session_state["sched_last_kind"] = "반입" if dnd_result["kind"] == KIND_IN else "반출"
-                    st.rerun()
-        else:
-            user_sel_ids_cur = [s["id"] for s in st.session_state.get("user_sel_sched_list", [])]
-            user_dnd = dnd_timeline(
-                slots=TIME_SLOTS,
-                in_schedules=[s for s in schedules if s.get("kind") == KIND_IN],
-                out_schedules=[s for s in schedules if s.get("kind") == KIND_OUT],
-                is_admin=False,
-                sel_in_slots=st.session_state.get("sched_sel_in_slots", []),
-                sel_out_slots=st.session_state.get("sched_sel_out_slots", []),
-                username=user_name,
-                user_sel_ids=user_sel_ids_cur,
-                key="user_dnd",
-            )
-            if user_dnd and user_dnd.get("ts") != st.session_state.get("_user_dnd_ts"):
-                st.session_state["_user_dnd_ts"] = user_dnd["ts"]
-                action = user_dnd.get("action")
-                if action == "toggle_book":
-                    key_ = "sched_sel_in_slots" if user_dnd["kind"] == KIND_IN else "sched_sel_out_slots"
-                    lst  = list(st.session_state.get(key_, []))
-                    st.session_state[key_] = _consecutive_toggle(lst, user_dnd["slot"])
-                    st.session_state["sched_last_kind"] = "반입" if user_dnd["kind"] == KIND_IN else "반출"
-                    st.rerun()
-                elif action == "user_select":
-                    sid   = user_dnd["sched_id"]
-                    sched_ = next((s for s in schedules if s["id"] == sid), None)
-                    if sched_:
-                        lst = list(st.session_state.get("user_sel_sched_list", []))
-                        if any(s["id"] == sid for s in lst):
-                            lst = [s for s in lst if s["id"] != sid]
-                        else:
-                            lst = [sched_]  # 단일 선택
-                        st.session_state["user_sel_sched_list"] = lst
-                    st.rerun()
+        render_timeline(schedules, is_admin=is_admin, user_name=user_name)
 
         render_daily_summary(schedules)
 
