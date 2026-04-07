@@ -709,6 +709,17 @@ def inject_css():
         min-width: 100% !important;
         max-width: 100% !important;
       }
+      /* 타임라인 행: 100% 규칙 오버라이드 — 3컬럼 고정 유지 */
+      [class*="st-key-tl_row_"] [data-testid="stHorizontalBlock"],
+      [class*="st-key-tl_header"] [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+      }
+      [class*="st-key-tl_row_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+      [class*="st-key-tl_header"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+        flex: unset !important;
+        min-width: 0 !important;
+        max-width: none !important;
+      }
       /* 히어로 헤더 간소화 */
       .hero { padding: 12px 16px !important; }
       .hero .title { font-size: 18px !important; }
