@@ -3,3 +3,5 @@ qrcode[pil]
 Pillow
 reportlab
 streamlit-drawable-canvas
+pymupdf
+supabase>=2.0.0
