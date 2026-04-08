@@ -1244,13 +1244,32 @@ def inject_css():
         display: block !important;
         margin-bottom: 12px !important;
       }
-      /* Step 1: 오른쪽 열(예약폼) 숨김 */
+      /* ── 2-Step 열 hide + 가시 열 100% 확장 ── */
+      /* Step 1: 우열(예약폼) 숨김 */
       .st-key-sched_layout_step1 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
         display: none !important;
       }
-      /* Step 2: 왼쪽 열(타임라인) 숨김 */
+      /* Step 1: 좌열(타임라인) 100% */
+      .st-key-sched_layout_step1 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {
+        gap: 0 !important;
+      }
+      .st-key-sched_layout_step1 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
+        flex: 0 0 100% !important;
+        max-width: 100% !important;
+        min-width: 100% !important;
+      }
+      /* Step 2: 좌열(타임라인) 숨김 */
       .st-key-sched_layout_step2 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
         display: none !important;
+      }
+      /* Step 2: 우열(예약폼) 100% */
+      .st-key-sched_layout_step2 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {
+        gap: 0 !important;
+      }
+      .st-key-sched_layout_step2 > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
+        flex: 0 0 100% !important;
+        max-width: 100% !important;
+        min-width: 100% !important;
       }
     }
 
