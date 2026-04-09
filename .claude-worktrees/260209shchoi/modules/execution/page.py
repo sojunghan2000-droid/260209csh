@@ -111,5 +111,5 @@ def page_execute(sb: Client):
             except Exception:
                 pass
             st.session_state.pop(reedit_key, None)
-            st.toast("확인 등록 완료!", isb="✅")
+            st.toast("확인 등록 완료!", icon="✅")
             st.rerun()

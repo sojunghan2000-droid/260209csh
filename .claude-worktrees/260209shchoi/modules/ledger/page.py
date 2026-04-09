@@ -90,6 +90,7 @@ def page_ledger(sb: Client):
         if q and q not in f"{disp_id} {r.get('company_name','')} {r.get('item_name','')}".lower():
             continue
         filtered.append(r)
+    filtered.sort(key=lambda r: (r.get('date') or '', r.get('created_at') or ''), reverse=True)
     st.caption(f"총 {len(filtered)}건")
     for r in filtered:
         rid      = r['id']
