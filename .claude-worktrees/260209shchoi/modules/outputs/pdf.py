@@ -33,10 +33,10 @@ try:
     _TMP = tempfile.gettempdir()
     # 폰트 후보: 로컬 경로 우선, 없으면 GitHub에서 다운로드
     _NANUM_URL_N = (
-        "https://github.com/googlefonts/nanum-gothic/raw/main/fonts/ttf/NanumGothic-Regular.ttf"
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
     )
     _NANUM_URL_B = (
-        "https://github.com/googlefonts/nanum-gothic/raw/main/fonts/ttf/NanumGothic-Bold.ttf"
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Bold.ttf"
     )
     _candidates_normal = [
         "C:/Windows/Fonts/malgun.ttf",
