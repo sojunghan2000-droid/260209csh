@@ -42,7 +42,9 @@ try:
     _NANUM_URL_B = (
         "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Bold.ttf"
     )
+    _BUNDLE_DIR = os.path.join(os.path.dirname(__file__), "fonts")
     _candidates_normal = [
+        os.path.join(_BUNDLE_DIR, "NanumGothic.ttf"),  # 번들 폰트 최우선
         "C:/Windows/Fonts/malgun.ttf",
         "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
         "/usr/share/fonts/nanum/NanumGothic.ttf",
@@ -50,6 +52,7 @@ try:
         os.path.join(_TMP, "NanumGothic.ttf"),   # 캐시 다운로드
     ]
     _candidates_bold = [
+        os.path.join(_BUNDLE_DIR, "NanumGothicBold.ttf"),  # 번들 폰트 최우선
         "C:/Windows/Fonts/malgunbd.ttf",
         "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
         "/usr/share/fonts/nanum/NanumGothicBold.ttf",
@@ -57,7 +60,7 @@ try:
         os.path.join(_TMP, "NanumGothicBold.ttf"),
     ]
 
-    # 로컬 경로에 없으면 다운로드 후 /tmp에 캐시
+    # 번들 폰트가 없는 경우에만 로컬/다운로드 시도
     _found_normal = any(os.path.exists(p) for p in _candidates_normal[:-1])
     if not _found_normal:
         _download_nanum(_NANUM_URL_N, os.path.join(_TMP, "NanumGothic.ttf"))
