@@ -5,6 +5,15 @@ from supabase import Client
 from config import APP_VERSION, DEFAULT_SITE_NAME
 from db.models import settings_get
 
+
+@st.cache_data(ttl=30)
+def _fetch_kpi_today(_con: Client, project_id: str, today: str) -> list:
+    """당일 KPI 데이터 조회 — 30초 캐시."""
+    res = _con.table("requests").select("status,vehicle_count") \
+        .eq("project_id", project_id).eq("date", today).execute()
+    return res.data or []
+
+
 def ui_header(con: Client):
     """Render hero header with KPI stats (당일 기준)."""
     site_name = st.session_state.get("PROJECT_NAME") or settings_get(con, "site_name", DEFAULT_SITE_NAME)
@@ -14,10 +23,8 @@ def ui_header(con: Client):
     project_id = st.session_state.get("PROJECT_ID", "")
     today = date.today().isoformat()
 
-    # 당일 요청만 집계 (전체 대신 당일 KPI)
-    res = con.table("requests").select("status,vehicle_count") \
-        .eq("project_id", project_id).eq("date", today).execute()
-    rows = res.data or []
+    # 당일 요청만 집계 (30초 캐시 적용)
+    rows = _fetch_kpi_today(con, project_id, today)
     total      = len(rows)
     pending    = sum(1 for r in rows if r.get("status") == "PENDING_APPROVAL")
     approved   = sum(1 for r in rows if r.get("status") in ("APPROVED", "EXECUTING"))

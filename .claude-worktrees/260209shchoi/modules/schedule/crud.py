@@ -24,7 +24,7 @@ def schedule_insert(sb: Client, project_id: str, data: dict) -> str:
         "created_by":    data.get("created_by", ""),
         "created_at":    now_str(),
     }).execute()
-    st.cache_data.clear()   # ③ 캐시 무효화 — 삽입 즉시 타임라인 반영
+    schedule_list_by_date.clear()   # ③ 삽입 즉시 타임라인 반영
     return sid
 
 
@@ -54,12 +54,12 @@ def schedule_update(sb: Client, sid: str, **kwargs) -> None:
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
     if filtered:
         sb.table("schedules").update(filtered).eq("id", sid).execute()
-        st.cache_data.clear()   # ③ 수정 즉시 타임라인 반영
+        schedule_list_by_date.clear()   # ③ 수정 즉시 타임라인 반영
 
 
 def schedule_delete(sb: Client, sid: str) -> None:
     sb.table("schedules").delete().eq("id", sid).execute()
-    st.cache_data.clear()   # ③ 삭제 즉시 타임라인 반영
+    schedule_list_by_date.clear()   # ③ 삭제 즉시 타임라인 반영
 
 
 def schedule_get(sb: Client, sid: str) -> Optional[Dict[str, Any]]:
@@ -135,7 +135,7 @@ def schedule_sync_from_requests(sb: Client, project_id: str) -> None:
     # ⑤ 신규 rows가 있을 때만 한 번에 bulk INSERT
     if bulk_rows:
         sb.table("schedules").insert(bulk_rows).execute()
-        st.cache_data.clear()   # ③ sync insert 후 타임라인 즉시 반영
+        schedule_list_by_date.clear()   # ③ sync insert 후 타임라인 즉시 반영
 
 
 def _add_30min(time_str: str) -> str:

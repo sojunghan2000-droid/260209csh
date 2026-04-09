@@ -68,7 +68,6 @@ def page_ledger(sb: Client):
     </style>
     """, unsafe_allow_html=True)
     st.markdown("### 📚 대장")
-    rows = req_list(sb, None, None, 100)
 
     is_admin  = st.session_state.get("IS_ADMIN", False)
     role      = st.session_state.get("USER_ROLE", "")
@@ -80,12 +79,14 @@ def page_ledger(sb: Client):
     with f2:
         status = st.selectbox("상태", ["ALL"] + REQ_STATUS)
     q = st.text_input("검색").strip().lower()
+
+    # kind/status 필터를 DB 쿼리로 전달 — 불필요한 데이터 fetch 방지
+    db_kind   = None if kind   == "ALL" else kind
+    db_status = None if status == "ALL" else status
+    rows = req_list(sb, db_status, db_kind, 50)
+
     filtered = []
     for r in rows:
-        if kind != "ALL" and r['kind'] != kind:
-            continue
-        if status != "ALL" and r['status'] != status:
-            continue
         disp_id = req_display_id(r)
         if q and q not in f"{disp_id} {r.get('company_name','')} {r.get('item_name','')}".lower():
             continue

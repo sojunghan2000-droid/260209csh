@@ -6,7 +6,7 @@ import streamlit as st
 from supabase import Client
 from shared.helpers import now_str
 from db.models import settings_get
-from modules.request.crud import req_update_status
+from modules.request.crud import req_update_status, req_get, req_list
 
 
 def routing_get(sb: Client) -> Dict[str, List[str]]:
@@ -24,7 +24,8 @@ def approvals_create_default(sb: Client, rid: str, kind: str) -> None:
         for i, role in enumerate(roles, start=1)
     ]
     sb.table("approvals").insert(rows).execute()
-    st.cache_data.clear()
+    approvals_inbox.clear()
+    approvals_for_req.clear()
 
 
 @st.cache_data(ttl=3)
@@ -69,5 +70,8 @@ def approval_mark(
     result = res.data or {}
     if isinstance(result, list):
         result = result[0] if result else {}
-    st.cache_data.clear()
+    approvals_inbox.clear()
+    approvals_for_req.clear()
+    req_get.clear()
+    req_list.clear()
     return result.get("rid", ""), result.get("msg", "처리 완료")

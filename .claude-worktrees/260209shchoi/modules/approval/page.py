@@ -109,9 +109,12 @@ def page_approval(sb: Client):
                 st.error("서명이 필요합니다.")
             else:
                 rid2, msg = approval_mark(sb, approval_id, "APPROVE", user_name, user_role, sign_path, stamp_path, "")
-                st.success(msg)
                 if req_get(sb, rid2).get("status") == "APPROVED":
-                    generate_all_outputs(sb, rid2)
+                    with st.spinner("⏳ 산출물 생성 중... (잠시 기다려 주세요)"):
+                        generate_all_outputs(sb, rid2)
+                    st.success("✅ " + msg + " · 산출물 생성 완료")
+                else:
+                    st.success(msg)
                 st.rerun()
     with c2:
         if st.button("반려", use_container_width=True):

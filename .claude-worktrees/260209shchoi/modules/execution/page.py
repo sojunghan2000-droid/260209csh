@@ -61,7 +61,7 @@ def page_execute(sb: Client):
     st.markdown("### 📸 확인 등록")
     today = date.today().isoformat()
     candidates = [
-        r for r in req_list(sb, None, None, 500)
+        r for r in req_list(sb, None, None, 50)
         if r['status'] in ['APPROVED', 'EXECUTING', 'DONE']
         and (r.get('date') or '') >= today
     ]

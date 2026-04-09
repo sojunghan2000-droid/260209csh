@@ -24,7 +24,7 @@ def req_insert(sb: Client, data: Dict[str, Any]) -> str:
         **{k: data.get(k) for k in cols if k not in ("id", "created_at", "updated_at", "status")},
     }
     sb.table("requests").insert(row).execute()
-    st.cache_data.clear()
+    req_list.clear()
     return rid
 
 
@@ -56,14 +56,16 @@ def req_list(
 
 def req_update_status(sb: Client, rid: str, status: str) -> None:
     sb.table("requests").update({"status": status, "updated_at": now_str()}).eq("id", rid).execute()
-    st.cache_data.clear()
+    req_get.clear()
+    req_list.clear()
 
 
 def req_update_time(sb: Client, rid: str, time_from: str, time_to: str) -> None:
     sb.table("requests").update({
         "time_from": time_from, "time_to": time_to, "updated_at": now_str(),
     }).eq("id", rid).execute()
-    st.cache_data.clear()
+    req_get.clear()
+    req_list.clear()
 
 
 def req_delete(sb: Client, rid: str) -> None:
@@ -74,4 +76,4 @@ def req_delete(sb: Client, rid: str) -> None:
     sb.table("outputs").delete().eq("req_id", rid).execute()
     sb.table("schedules").delete().eq("req_id", rid).execute()
     sb.table("requests").delete().eq("id", rid).execute()
-    st.cache_data.clear()
+    st.cache_data.clear()  # 여러 테이블 일괄 삭제 — 전체 초기화 유지

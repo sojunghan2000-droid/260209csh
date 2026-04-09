@@ -53,7 +53,7 @@ def photo_add(
         "label": label, "file_path": file_path, "storage_url": storage_url,
         "file_hash": fhash, "created_at": now_str(),
     }).execute()
-    st.cache_data.clear()
+    photos_for_req.clear()
     return storage_url or file_path
 
 
@@ -74,7 +74,7 @@ def photo_delete_slot(sb: Client, rid: str, slot_key: str) -> None:
         except Exception:
             pass
     sb.table("photos").delete().eq("req_id", rid).eq("slot_key", slot_key).execute()
-    st.cache_data.clear()
+    photos_for_req.clear()
 
 
 @st.cache_data(ttl=5)
@@ -102,7 +102,7 @@ def execution_upsert(
         "executed_at": now_str(), "check_json": json.dumps(check_json, ensure_ascii=False),
         "required_photo_ok": ok, "notes": notes,
     }, on_conflict="req_id").execute()
-    st.cache_data.clear()
+    execution_get.clear()
 
 
 @st.cache_data(ttl=5)

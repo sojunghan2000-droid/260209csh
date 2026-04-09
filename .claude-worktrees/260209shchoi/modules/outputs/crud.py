@@ -37,7 +37,7 @@ def outputs_upsert(sb: Client, rid: str, **paths: str) -> None:
     for k, v in paths.items():
         if v is not None:
             sb.table("outputs").update({k: v, "updated_at": now_str()}).eq("req_id", rid).execute()
-    st.cache_data.clear()
+    outputs_get.clear()
 
 
 @st.cache_data(ttl=5)
