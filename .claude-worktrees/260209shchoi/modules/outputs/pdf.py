@@ -23,10 +23,14 @@ try:
     def _download_nanum(url: str, dest: str) -> bool:
         """폰트를 URL에서 다운로드해 dest에 저장. 성공 시 True."""
         try:
-            if os.path.exists(dest):
+            # 유효한 TTF 파일이면 재사용 (폰트 파일은 최소 100KB 이상)
+            if os.path.exists(dest) and os.path.getsize(dest) > 100_000:
                 return True
+            # 불완전하거나 잘못된 캐시 파일 삭제
+            if os.path.exists(dest):
+                os.remove(dest)
             urllib.request.urlretrieve(url, dest)
-            return os.path.exists(dest)
+            return os.path.exists(dest) and os.path.getsize(dest) > 100_000
         except Exception:
             return False
 
