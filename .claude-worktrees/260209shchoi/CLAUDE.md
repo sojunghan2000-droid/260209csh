@@ -20,6 +20,37 @@ pip install -r requirements.txt
 python -m py_compile app.py
 ```
 
+## 배포 (Deployment)
+
+**플랫폼:** Streamlit Community Cloud (Vercel 아님 — Streamlit 앱은 Vercel 네이티브 미지원)
+
+**배포 URL:** https://material-process-management-fwj7blrkqcledcn35xrkav.streamlit.app/
+
+**자동 재배포:** `mpm` remote의 `master` 브랜치에 push되면 Streamlit Cloud가 자동으로 재빌드·재배포 (별도 배포 명령 불필요).
+
+**Git remote 구성:**
+
+| remote | URL | 역할 |
+|---|---|---|
+| `mpm` | `https://github.com/sojunghan2000-droid/Material-Process-Management.git` | **배포 연결 레포** — Streamlit Cloud가 이 레포를 추적 |
+| `origin` | `https://github.com/sojunghan2000-droid/260209csh.git` | 보조 레포 — `mpm`과 동기화 유지 권장 |
+
+**배포 절차:**
+```bash
+# 1. fast-forward 안전 확인
+git merge-base --is-ancestor mpm/master master && echo OK
+
+# 2. 양쪽 remote에 master 푸시 (순서 무관)
+git push mpm master
+git push origin master
+
+# 3. 배포 URL 접속하여 Streamlit Cloud 빌드 완료 및 정상 동작 확인
+```
+
+**주의:**
+- `.streamlit/secrets.toml`은 커밋하지 않음 (untracked). Streamlit Cloud의 **App settings → Secrets**에서 관리.
+- force push 금지 (배포 히스토리 보호).
+
 ## 디렉토리 구조
 ```
 app.py              # 진입점 + 페이지 라우터
